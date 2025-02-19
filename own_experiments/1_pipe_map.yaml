@@ -1,0 +1,62 @@
+datasets:
+  transcripts: 
+    path: medical_transcripts.json
+    type: file
+
+default_model: gpt-4o-mini
+
+system_prompt:
+  dataset_description: a collection of transcripts from doctor visits
+  persona: a medical practitioner analyzing patient symptoms and reactions to medications
+
+operations: 
+  - name: extract_medical_summary
+    type: map
+    sample: 10
+    output:
+      schema:
+        age: int
+        gender: str
+        chronic_conditions: "list[str]"
+        chronic_conditions_icd_10: "list[str]"
+        chronic_conditions_icd_11: "list[str]"
+        acute_present_reasons: "list[str]"
+        differential_diagnosis: "list[str]"
+    prompt: |
+      Analyze the following medical transcript :
+      {{ input.src }}
+
+      Extract and structure the following information:
+      1. Patient's age (as a number)
+      2. Patient's gender (male/female/other)
+      3. Any chronic conditions mentioned (e.g., diabetes, hypertension, asthma)
+      4. The ICD 10 and ICD 11 codes for the aforementioned chronic conditions
+      5. Acute reasons for the current visit/presentation
+      6. A differential diagnosis that explain the current presentation
+      7. The ICD 10 codes for the acute reasons for the visit, if applicable
+
+      Ensure:
+      - Age is provided as a number only (e.g., 45 not "45 years old")
+      - Gender is a single word (male/female/other)
+      - Chronic conditions and acute presentations are listed separately
+      - Make sure that the ICD codes are as finely grained as possible, without inferring information that is not present in the source
+      - Only include clearly stated conditions (do not infer or assume)
+    # validate:
+    #   - isinstance(output.age, int)
+    #   - output.age > 0 and output.age < 120
+    #   - output.gender in ['male', 'female', 'other']
+    #   - isinstance(output.chronic_conditions, list)
+    #   - isinstance(output.acute_presentations, list)
+    #   - all(isinstance(condition, str) for condition in output.chronic_conditions)
+    #   - all(isinstance(presentation, str) for presentation in output.acute_presentations)
+
+pipeline:
+  steps:
+    - name: medical_info_extraction
+      input: transcripts
+      operations:
+        - extract_medical_summary
+  output:
+    type: file
+    path: medical_summaries.json
+    intermediate_dir: intermediate_results

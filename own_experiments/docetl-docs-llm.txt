@@ -1,0 +1,1589 @@
+Quick Start Tutorial
+
+Initializing search
+
+ucbepic/docetl
+
+  * Getting Started 
+  * User Guide 
+  * Tutorials & Examples 
+  * Developer Reference 
+  * Tools & Resources 
+
+docetl docs
+
+ucbepic/docetl
+
+  * Getting Started 
+
+Getting Started
+
+    * Installation 
+    * Quick Start Tutorial  Quick Start Tutorial  Table of contents 
+      * Installation 
+      * Setting up API Keys 
+      * Preparing the Data 
+      * Creating the Pipeline 
+      * Running the Pipeline 
+      * Further Questions 
+    * Best Practices 
+  * User Guide 
+  * Tutorials & Examples 
+  * Developer Reference 
+  * Tools & Resources 
+
+Table of contents
+
+  * Installation 
+  * Setting up API Keys 
+  * Preparing the Data 
+  * Creating the Pipeline 
+  * Running the Pipeline 
+  * Further Questions 
+
+# Tutorial: Analyzing Medical Transcripts with DocETL
+
+This tutorial will guide you through the process of using DocETL to analyze medical transcripts and extract medication information. We'll create a pipeline that identifies medications, resolves similar names, and generates summaries of side effects and therapeutic uses.
+
+## Installation
+
+First, let's install DocETL. Follow the instructions in the installation guide to set up DocETL on your system.
+
+## Setting up API Keys
+
+DocETL uses LiteLLM under the hood, which supports various LLM providers. For this tutorial, we'll use OpenAI, as DocETL tests and existing pipelines are run with OpenAI.
+
+Setting up your API Key
+
+Set your OpenAI API key as an environment variable:
+
+```
+export OPENAI_API_KEY=your_api_key_here
+
+```
+
+Alternatively, you can create a `.env` file in your project directory and add the following line:
+
+```
+OPENAI_API_KEY=your_api_key_here
+
+```
+
+OpenAI Dependency
+
+DocETL has been primarily tested with OpenAI's language models and relies heavily on their structured output capabilities. While we aim to support other providers in the future, using OpenAI is currently recommended for the best experience and most reliable results.
+
+If you choose to use a different provider, be aware that you may encounter unexpected behavior or reduced functionality, especially with operations that depend on structured outputs. We use tool calling to extract structured outputs from the LLM's response, so make sure your provider supports tool calling.
+
+If using a Gemini model, you can use the `gemini` prefix for the model name. For example, `gemini/gemini-1.5-flash-002`. (This has worked pretty well for us so far, and is so cheap!)
+
+If using Ollama (e.g., llama 3.2), make sure your output schemas are not too complex, since these models are not as good as OpenAI for structured outputs! For example, use parallel map operations to reduce the number of output attributes per prompt.
+
+## Preparing the Data
+
+Organize your medical transcript data in a JSON file as a list of objects. Each object should have a "src" key containing the transcript text. You can download the example dataset here.
+
+Sample Data Structure
+
+```
+[
+    {
+        "src": "Doctor: Hello, Mrs. Johnson. How have you been feeling since starting the new medication, Lisinopril?\nPatient: Well, doctor, I've noticed my blood pressure has improved, but I've been experiencing some dry cough...",
+    },
+    {
+        "src": "Doctor: Good morning, Mr. Smith. I see you're here for a follow-up on your Metformin prescription.\nPatient: Yes, doctor. I've been taking it regularly, but I'm concerned about some side effects I've been experiencing...",
+    }
+]
+
+```
+
+Save this file as `medical_transcripts.json` in your project directory.
+
+## Creating the Pipeline
+
+Now, let's create a DocETL pipeline to analyze this data. We'll use a series of operations to extract and process the medication information:
+
+  1. **Medication Extraction** : Analyze each transcript to identify and list all mentioned medications.
+  2. **Unnesting** : The extracted medication list is flattened, such that each medication (and associated data) is a separate document. This operator is akin to the pandas `explode` operation.
+  3. **Medication Resolution** : Similar medication names are resolved to standardize the entries. This step helps in consolidating different variations or brand names of the same medication. For example, step 1 might extract "Ibuprofen" and "Motrin 800mg" as separate medications, and step 3 might resolve them to a single "Ibuprofen" entry.
+  4. **Summary Generation** : For each unique medication, generate a summary of side effects and therapeutic uses based on information from all relevant transcripts.
+
+Create a file named `pipeline.yaml` with the following structure:
+
+Pipeline Structure
+
+```
+datasets:
+  transcripts:
+    path: medical_transcripts.json
+    type: file
+
+default_model: gpt-4o-mini
+
+system_prompt: # This is optional, but recommended for better performance. It is applied to all operations in the pipeline.
+  dataset_description: a collection of transcripts of doctor visits
+  persona: a medical practitioner analyzing patient symptoms and reactions to medications
+
+operations:
+  - name: extract_medications
+    type: map
+    output:
+      schema:
+        medication: list[str]
+    prompt: |
+      Analyze the following transcript of a conversation between a doctor and a patient:
+      {{ input.src }}
+      Extract and list all medications mentioned in the transcript.
+      If no medications are mentioned, return an empty list.
+
+  - name: unnest_medications
+    type: unnest
+    unnest_key: medication
+
+  - name: resolve_medications
+    type: resolve
+    blocking_keys:
+      - medication
+    blocking_threshold: 0.6162
+    comparison_prompt: |
+      Compare the following two medication entries:
+      Entry 1: {{ input1.medication }}
+      Entry 2: {{ input2.medication }}
+      Are these medications likely to be the same or closely related?
+    embedding_model: text-embedding-3-small
+    output:
+      schema:
+        medication: str
+    resolution_prompt: |
+      Given the following matched medication entries:
+      {% for entry in inputs %}
+      Entry {{ loop.index }}: {{ entry.medication }}
+      {% endfor %}
+      Determine the best resolved medication name for this group of entries. The resolved
+      name should be a standardized, widely recognized medication name that best represents
+      all matched entries.
+
+  - name: summarize_prescriptions
+    type: reduce
+    reduce_key:
+      - medication
+    output:
+      schema:
+        side_effects: str
+        uses: str
+    prompt: |
+      Here are some transcripts of conversations between a doctor and a patient:
+
+      {% for value in inputs %}
+      Transcript {{ loop.index }}:
+      {{ value.src }}
+      {% endfor %}
+
+      For the medication {{ reduce_key }}, please provide the following information based on all the transcripts above:
+
+      1. Side Effects: Summarize all mentioned side effects of {{ reduce_key }}.
+      2. Therapeutic Uses: Explain the medical conditions or symptoms for which {{ reduce_key }} was prescribed or recommended.
+
+      Ensure your summary:
+      - Is based solely on information from the provided transcripts
+      - Focuses only on {{ reduce_key }}, not other medications
+      - Includes relevant details from all transcripts
+      - Is clear and concise
+      - Includes quotes from the transcripts
+
+pipeline:
+  steps:
+    - name: medical_info_extraction
+      input: transcripts
+      operations:
+        - extract_medications
+        - unnest_medications
+        - resolve_medications
+        - summarize_prescriptions
+  output:
+    type: file
+    path: medication_summaries.json
+    intermediate_dir: intermediate_results
+
+```
+
+## Running the Pipeline
+
+Pipeline Performance
+
+When running this pipeline on a sample dataset, we observed the following performance metrics using `gpt-4o-mini` as defined in the pipeline:
+
+  * Total cost: $0.10
+  * Total execution time: 49.13 seconds
+
+If you want to run it on a smaller sample, set the `sample` parameter for the map operation. For example, `sample: 10` will run the pipeline on a random sample of 10 transcripts:
+
+```
+operations:
+  - name: extract_medications
+    type: map
+    sample: 10
+    ...
+
+```
+
+To execute the pipeline, run the following command in your terminal:
+
+```
+docetl run pipeline.yaml
+
+```
+
+This will process the medical transcripts, extract medication information, resolve similar medication names, and generate summaries of side effects and therapeutic uses for each medication. The results will be saved in `medication_summaries.json`.
+
+## Further Questions
+
+What if I want to focus on a specific type of medication or medical condition?
+
+You can modify the prompts in the `extract_medications` and `summarize_prescriptions` operations to focus on specific types of medications or medical conditions. For example, you could update the `extract_medications` prompt to only list medications related to cardiovascular diseases.
+
+How can I improve the accuracy of medication name resolution?
+
+The `resolve_medications` operation uses a blocking threshold and comparison prompt to identify similar medication names. Learn more about how to configure this operation in the resolve operation documentation. To automatically find the optimal blocking threshold for your data, you can invoke the optimizer, as described in the optimization documentation.
+
+Can I process other types of medical documents with this pipeline?
+
+Yes, you can adapt this pipeline to process other types of medical documents by modifying the input data format and adjusting the prompts in each operation. For example, you could use it to analyze discharge summaries, clinical notes, or research papers by updating the extraction and summarization prompts accordingly.
+
+How can I optimize the performance of this pipeline?
+
+If you're unsure about the optimal configuration for your specific use case, you can use DocETL's optimizer, which can be invoked using `docetl build` instead of `docetl run`. Learn more about the optimizer in the optimization documentation.
+
+How can I use the pandas integration?
+
+DocETL provides a pandas integration for a few operators (map, filter, merge, agg). Learn more about the pandas integration in the pandas documentation.
+
+Previous
+
+Installation
+
+Next
+
+Best Practices
+
+Best Practices
+
+Initializing search
+
+ucbepic/docetl
+
+  * Getting Started 
+  * User Guide 
+  * Tutorials & Examples 
+  * Developer Reference 
+  * Tools & Resources 
+
+docetl docs
+
+ucbepic/docetl
+
+  * Getting Started 
+
+Getting Started
+
+    * Installation 
+    * Quick Start Tutorial 
+    * Best Practices  Best Practices  Table of contents 
+      * Pipeline Design 
+      * Schema and Prompt Design 
+      * Handling Large Documents and Entity Resolution 
+      * Optimization and Execution 
+      * Additional Notes 
+  * User Guide 
+  * Tutorials & Examples 
+  * Developer Reference 
+  * Tools & Resources 
+
+Table of contents
+
+  * Pipeline Design 
+  * Schema and Prompt Design 
+  * Handling Large Documents and Entity Resolution 
+  * Optimization and Execution 
+  * Additional Notes 
+
+# Best Practices for DocETL
+
+This guide outlines best practices for using DocETL effectively, focusing on the most important aspects of pipeline creation, execution, and optimization.
+
+Supported Models
+
+DocETL supports many models through LiteLLM:
+
+  * OpenAI models (e.g., GPT-4, GPT-3.5-turbo)
+  * Anthropic models (e.g., Claude 2, Claude Instant)
+  * Google VertexAI models (e.g., chat-bison, text-bison)
+  * Cohere models
+  * Replicate models
+  * Azure OpenAI models
+  * Hugging Face models
+  * AWS Bedrock models (e.g., Claude, AI21, Cohere)
+  * Gemini models (e.g., gemini-1.5-pro)
+  * Ollama models (e.g., llama2)
+
+For a complete and up-to-date list of supported models, please refer to the LiteLLM documentation. You can use the model name just like the litellm documentation (e.g., `openai/gpt-4o-mini` or `gemini/gemini-1.5-flash-002`).
+
+While DocETL supports various models, it has been primarily tested with OpenAI's language models. Using OpenAI is currently recommended for the best experience and most reliable results, especially for operations that depend on structured outputs. We have also tried gemini-1.5-flash-002 and found it to be pretty good for a much cheaper price.
+
+## Pipeline Design
+
+  1. **Start Simple** : Begin with a basic pipeline and gradually add complexity as needed.
+
+Example: Start with a simple extraction operation before adding resolution and summarization.
+
+```
+operations:
+  - name: extract_medications
+    type: map
+    output:
+      schema:
+        medication: list[str]
+    prompt: |
+      Extract and list all medications mentioned in the transcript:
+      {{ input.src }}
+
+```
+
+  1. **Modular Design** : Break down complex tasks into smaller, manageable operations.
+
+Example: The medical transcripts pipeline in the tutorial demonstrates this by separating medication extraction, resolution, and summarization into distinct operations.
+
+  1. **Optimize Incrementally** : Optimize one operation at a time to ensure stability and verify improvements.
+
+Example: After implementing the basic pipeline, you might optimize the `extract_medications` operation first:
+
+```
+operations:
+  - name: extract_medications
+    type: map
+    optimize: true
+    output:
+      schema:
+        medication: list[str]
+    prompt: |
+      Extract and list all medications mentioned in the transcript:
+      {{ input.src }}
+
+```
+
+## Schema and Prompt Design
+
+  1. **Configure System Prompts** : Set up system prompts to provide context and establish the LLM's role for each operation. This helps generate more accurate and relevant responses.
+
+Example:
+
+```
+system_prompt:
+  dataset_description: a collection of transcripts of doctor visits
+  persona: a medical practitioner analyzing patient symptoms and reactions to medications
+
+```
+
+The system prompt will be used as a system prompt for all operations in the pipeline.
+
+  1. **Keep Schemas Simple** : Use simple output schemas whenever possible. Complex nested structures can be difficult for LLMs to produce consistently.
+
+Good Example (Simple Schema):
+
+```
+output:
+  schema:
+    medication: list[str] # Note that this is different from the example in the tutorial.
+
+```
+
+Avoid (Complex Nested Structure):
+
+```
+output:
+  schema:
+    medications: "list[{name: str, dosage: {amount: float, unit: str, frequency: str}}]"
+
+```
+
+  1. **Clear and Concise Prompts** : Write clear, concise prompts for LLM operations, providing relevant context from input data. Instruct quantities (e.g., 2-3 insights, one summary) to guide the LLM.
+
+Example: The `summarize_prescriptions` operation in the tutorial demonstrates a clear prompt with specific instructions:
+
+```
+prompt: |
+  Here are some transcripts of conversations between a doctor and a patient:
+
+  {% for value in inputs %}
+  Transcript {{ loop.index }}:
+  {{ value.src }}
+  {% endfor %}
+
+  For the medication {{ reduce_key }}, please provide the following information based on all the transcripts above:
+
+  1. Side Effects: Summarize all mentioned side effects of {{ reduce_key }}. List 2-3 main side effects.
+  2. Therapeutic Uses: Explain the medical conditions or symptoms for which {{ reduce_key }} was prescribed or recommended. Provide 1-2 primary uses.
+
+  Ensure your summary:
+  - Is based solely on information from the provided transcripts
+  - Focuses only on {{ reduce_key }}, not other medications
+  - Includes relevant details from all transcripts
+  - Is clear and concise
+  - Includes quotes from the transcripts
+
+```
+
+  1. **Take advantage of Jinja Templating** : Use Jinja templating to dynamically generate prompts and provide context to the LLM. Feel free to use if statements, loops, and other Jinja features to customize prompts.
+
+Example: Using Jinja conditionals and loops in a prompt (note that age is a made-up field for this example):
+
+```
+prompt: |
+  Analyze the following medical transcript:
+  {{ input.src }}
+
+  {% if input.patient_age %}
+  Note that the patient is {{ input.patient_age }} years old.
+  {% endif %}
+
+  Please extract the following information:
+  {% for item in ["medications", "symptoms", "diagnoses"] %}
+  - List all {{ item }} mentioned in the transcript
+  {% endfor %}
+
+```
+
+  1. **Validate Outputs** : Use the `validate` field to ensure the quality and correctness of processed data. This consists of Python statements that validate the output and optionally retry the LLM if one or more statements fail. To learn more about validation, see the validation documentation.
+
+Example: Adding validation to the `extract_medications` operation:
+
+```
+operations:
+  - name: extract_medications
+    type: map
+    output:
+      schema:
+        medication: list[str]
+    prompt: |
+      Extract and list all medications mentioned in the transcript:
+      {{ input.src }}
+    validate: |
+      len(output.medication) > 0
+      all(isinstance(med, str) for med in output.medication)
+      all(len(med) > 1 for med in output.medication)
+
+```
+
+## Handling Large Documents and Entity Resolution
+
+  1. **Chunk Large Inputs** : For documents exceeding token limits, consider using the optimizer to automatically chunk inputs.
+
+  2. **Use Resolve Operations** : Implement resolve operations before reduce operations when dealing with similar entities. Take care to write the compare prompts well to guide the LLM--often the optimizer-synthesized prompts are too generic.
+
+Example: A more specific `resolve_medications` operation:
+
+```
+- name: resolve_medications
+  type: resolve
+  blocking_keys:
+    - medication
+  blocking_threshold: 0.6162
+  comparison_prompt: |
+    Compare the following two medication entries:
+    Entry 1: {{ input1.medication }}
+    Entry 2: {{ input2.medication }}
+
+    Are these medications the same or closely related? Consider the following:
+    1. Are they different brand names for the same active ingredient?
+    2. Are they in the same drug class with similar effects?
+    3. Are they commonly used as alternatives for the same condition?
+
+    Respond with YES if they are the same or closely related, and NO if they are distinct medications.
+
+```
+
+## Optimization and Execution
+
+  1. **Use the Optimizer** : Leverage DocETL's optimizer for complex pipelines or when dealing with large documents.
+
+Example: Run the optimizer on your pipeline:
+
+```
+docetl build pipeline.yaml
+
+```
+
+  1. **Leverage Caching** : Take advantage of DocETL's caching mechanism to avoid redundant computations. DocETL caches by default.
+
+To clear the cache:
+
+```
+docetl clear-cache
+
+```
+
+  1. **Monitor Resource Usage** : Keep an eye on API costs and processing time, especially when optimizing. Use `gpt-4o-mini` for optimization (the default is `gpt-4o`) to save costs. Learn more about how to do this in the optimizer docs.
+
+## Additional Notes
+
+  * **Sampling Operations** : If you want to run an operation on a random sample of your data, you can set the `sample` parameter for that operation.
+
+Example:
+
+```
+operations:
+  - name: extract_medications
+    type: map
+    sample: 100
+    output:
+      schema:
+        medication: list[str]
+    prompt: |
+      Extract and list all medications mentioned in the transcript:
+      {{ input.src }}
+
+```
+
+  * **Intermediate Output** : If you provide an intermediate directory in your configuration, the outputs of each operation will be saved to this directory. This allows you to inspect the results of individual steps in the pipeline and can be useful for debugging or analyzing the pipeline's progress.
+
+Example:
+
+```
+pipeline:
+  output:
+    type: file
+    path: medication_summaries.json
+    intermediate_dir: intermediate_results
+
+```
+
+By following these comprehensive best practices and examples, you can create more efficient, reliable, and maintainable DocETL pipelines for your data processing tasks. Remember to iterate on your pipeline design, continuously refine your prompts, and leverage DocETL's optimization features to get the best results.
+
+Previous
+
+Quick Start Tutorial
+
+Next
+
+Operators & Validation
+
+Made with  Material for MkDocsi
+
+1. 1 Introduction
+  2. 2 DocETL DSL and Operators
+    1. 2.1 Programming Model
+    2. 2.2 LLM-Powered Operators
+      1. 2.2.1 Map
+      2. 2.2.2 Reduce
+      3. 2.2.3 Resolve
+      4. 2.2.4 Other Operators
+    3. 2.3 Auxiliary Operators
+      1. 2.3.1 Unnest
+      2. 2.3.2 Split
+      3. 2.3.3 Gather
+  3. 3 Rewrite Directives
+    1. 3.1 Data Decomposition
+      1. 3.1.1 Document Chunking (Map)
+      2. 3.1.2 Multi-Level Aggregation (Reduce)
+    2. 3.2 LLM-Centric Improvements
+      1. 3.2.1 Gleaning (Map and Reduce)
+      2. 3.2.2 Duplicate Key Resolution (Reduce)
+    3. 3.3 Projection Synthesis
+  4. 4 Optimizer
+    1. 4.1 Optimization Approach
+    2. 4.2 Agent and System Implementation
+      1. 4.2.1 Generation Agents
+      2. 4.2.2 Validation Agents
+      3. 4.2.3 Implementation Details
+  5. 5 Evaluation
+    1. 5.1 Legal Contract Analysis
+      1. 5.1.1 Implementations
+      2. 5.1.2 Results
+    2. 5.2 Game Review Analysis
+      1. 5.2.1 Implementations
+      2. 5.2.2 Results
+    3. 5.3 Declassified Article Analysis
+      1. 5.3.1 Implementations
+      2. 5.3.2 Results
+    4. 5.4 Biomedical Classification
+      1. 5.4.1 Implementations
+      2. 5.4.2 Results
+    5. 5.5 Case Study: Police Misconduct
+    6. 5.6 User Adoption and Impact
+  6. 6 Discussion
+  7. 7 Related Work
+  8. 8 Conclusion
+  9. A Gather Operator Specifications
+    1. A.1 Gather Configuration
+    2. A.2 Header Lineage Preservation
+
+\usesmartdiagramlibrary
+
+additions \pdfcolInitStacktcb@breakable
+
+#  DocETL: Agentic Query Rewriting and Evaluation  
+for Complex Document Processing
+
+Shreya Shankar1, Tristan Chambers2, Tarak Shah2, Aditya G. Parameswaran1, Eugene Wu3 1UC Berkeley EECS, 2BIDS Police Records Access Project, 3Columbia University  
+{shreyashankar,tristan.chambers,tarak_shah,adityagp} @berkeley.edu, ewu@cs.columbia.edu
+
+###### Abstract.
+
+Analyzing unstructured data has been a persistent challenge in data processing. Large Language Models (LLMs) have shown promise in this regard, leading to recent proposals for declarative frameworks for LLM-powered processing of unstructured data. However, these frameworks focus on reducing cost when executing user-specified operations using LLMs, rather than improving accuracy, executing most operations as-is (in a single LLM call). This is problematic for complex tasks and data, where LLM outputs for user-defined operations are often inaccurate, even with optimized prompts. For example, an LLM may struggle to identify all instances of specific clauses, like force majeure or indemnification, in lengthy legal documents, requiring decomposition of the data, the task, or both.
+
+We present DocETL, a system that optimizes complex document processing pipelines, while accounting for LLM shortcomings. DocETL offers a declarative interface for users to define such pipelines and uses an agent-based approach to automatically optimize them, leveraging novel agent-based rewrites (that we call rewrite directives), as well as an optimization and evaluation framework. We introduce (i) logical rewriting of pipelines, tailored for LLM-based tasks, (ii) an agent-guided plan evaluation mechanism that synthesizes and orchestrates task-specific validation prompts, and (iii) an optimization algorithm that efficiently finds promising plans, considering the latencies of agent-based plan generation and evaluation. Our evaluation on four different unstructured document analysis tasks demonstrates that DocETL finds plans with outputs that are 25252525 to 80%percent8080\%80 % more accurate than well-engineered baselines, addressing a critical gap in unstructured data analysis. DocETL is open-source at docetl.org, and as of November 2024, has amassed over 1.3k GitHub Stars, with users spanning a variety of domains.
+
+††copyright: none††journalyear: 2024††doi: XXXXXXX.XXXXXXX
+
+##  1\. Introduction
+
+Figure 1. Optimization for a pipeline designed to accomplish the task in Example 1.1. The diagram illustrates the system mid-optimization of the initial map operation. DocETL employs LLMs to synthesize new plans using novel rewrite directives. The process begins with an LLM verifier determining if an operation is sufficiently optimized. If not, rewriting continues. Notably, when a new operation is synthesized as part of a rewrite, it undergoes immediate opportunistic optimization, as shown by the nested “Apply Rewrites (Agent)” rectangles.
+
+Large Language Models (LLMs) have taken the world of data management by storm, with applications ranging from data integration, to tuning, to query optimization, to data cleaning (Fernandez et al., 2023a). There has also been an interest, all in the last few months, in declarative approaches to process unstructured data using LLMs (Lin et al., 2024; Patel et al., 2024; Liu et al., 2024b; Anderson et al., 2024). These systems, instrumented as extensions to the relational model for processing textual columns, typically assume the text snippets per row are small and easy to process. They therefore focus on reducing cost, while keeping accuracy almost the same. However, for many real-world tasks, that we refer to as complex document processing tasks, accuracy can be a significant bottleneck, limiting practical utility. Here, complexity can stem from the documents or the nature of the processing task, or both. Consider this scenario from our collaborators on the Police Records Access Project111https://bids.berkeley.edu/california-police-records-access-project:
+
+###### Example 1.1 (Police Misconduct Identification).
+
+Journalists at Berkeley’s Investigative Reporting Program want to analyze a large corpus of heterogeneous police records, obtained through records requests, to uncover patterns of misconduct and procedural violations. Records include police reports, court transcripts, internal affairs and medical examiner reports, and other case files, often spanning hundreds of pages each. Analysis involves extracting key information from long documents, aggregating information across documents to identify behavioral patterns for each officer, and generating summaries highlighting concerning trends.
+
+Example 1.1 is representative of complex document processing tasks across domains including law, medicine, and social science. Consider a simpler version of this task, where we just want a summary of the role of each officer mentioned in each complex police record document, each with hundreds of pages. This task can be expressed as a single-step map operation applied to the OCR output per document, in one LLM call, with a user-provided prompt defining terms like “misconduct.” All existing systems (Lin et al., 2024; Patel et al., 2024; Liu et al., 2024b; Anderson et al., 2024) would simply execute the map operation, as is, with one LLM call per document. That is, they assume user-defined operations will yield sufficiently accurate results when executed by the LLM, and focus primarily on reducing cost. However, this map operation may provide poor accuracy for multiple reasons. First, the document in question may exceed the LLM’s context limit. Even if it fits, outputs may omit certain instances of misconduct, or include spurious information. Recent work has shown that LLM performance degrades considerably as length increases (Levy et al., 2024), because they can be distracted (Shi et al., 2023) or selectively pay attention to certain portions (Liu et al., 2024a), failing to gain a holistic understanding (Bai et al., 2023; Tang et al., 2023; Zhao et al., 2024; Jiang et al., 2023). Simultaneous theoretical work has shown that this degradation is due to limits in the transformer architecture (Peng et al., 2024; Sui et al., 2024; Kalai and Vempala, 2024). While one could apply prompt compilation (Khattab et al., 2024; Wen et al., 2024) to identify a better prompt, this relies on examples, which are either not present or are too long to include (e.g., an example document with hundreds of pages)—but irrespective do not fix the underlying challenges with LLMs performing a complex task on complex documents.
+
+Our key insight is that the quality of LLM outputs is often not adequate for complex data processing—we cannot simply treat the existing user-provided operators as fixed. Instead, we need to consider novel rewrites that decompose complex but error-prone operation(s) into a sequence of simpler and more accurate operations. For our map example, a different sequence of operations may increase accuracy. One such example is map →→\rightarrow→ map, where the first map is tasked with removing all portions of each input document that do not pertain to misconduct (e.g., medical reports), while the second map is the single-step map above. Or we could replace the first map with one that summarizes each sequence of k𝑘kitalic_k paragraphs into one, keeping the second map as is. Yet another option is to replace the single-step map with what we call split →→\rightarrow→ gather →→\rightarrow→ map →→\rightarrow→ reduce—a pattern that first splits the document into contiguous chunks; then, for each chunk, gathers k𝑘kitalic_k neighboring chunks before/after as context or background to be included into a prompt, generates per-officer summaries using its 2⁢k2𝑘2k2 italic_k neighbors as background context (map); and finally, performs a global summarization across all chunks (reduce).
+
+However, we cannot expect a user to rewrite their pipeline into multiple alternatives and determine the one with the best performance. The previous paragraph introduced three out of a multitude of potential rewrites, each of which could be recursively applied to operators in a pipeline, presenting a seemingly infinite set of options. For example, for the map →→\rightarrow→ map pipeline, there are many alternatives for what the first map could do, and many different associated prompts. Even if we decide to use the first map to summarize k𝑘kitalic_k chunks at a time, determining the right value for k𝑘kitalic_k is challenging. Likewise for split →→\rightarrow→ gather →→\rightarrow→ map →→\rightarrow→ reduce. Moreover, we’re just focusing on the first step of the overall goal in Example 1.1, which is to summarize misconduct across all documents. So, we may need to apply a reduce operation across documents to group and summarize misconduct extractions by officer. However, the same officer may be extracted as “Officer Smith” in one document and “J. Smith” in another, resulting in separate, incomplete summaries for what should be a single officer (Parameswaran et al., 2024). It’s not entirely clear how one would implement this form of entity resolution, and no current systems support it. In fact, additional context from the original document(s) may be necessary to determine if the two officers with the same name are identical. Finally, LLMs might struggle to recognize that multiple documents are from the same case, leading to overrepresentation of incidents in the misconduct summaries (van Schaik and Pugh, 2024). Overall, even an LLM expert would need extensive experimentation to design an accurate pipeline, given the dependency on the data, task, and LLM capabilities. This complexity underscores the need for a system that can automatically explore and evaluate different task decomposition strategies to find the most effective pipeline for a given task and dataset.
+
+We present DocETL, our first attempt at developing a declarative system optimized for accurate complex document processing. DocETL provides a declarative YAML-based interface for users to author pipelines with LLM-specific operators, including two new ones: resolve for entity resolution, and gather to maintain context when processing document chunks. Users can specify their pipeline at a high level with DocETL decomposing, rewriting, and optimizing the pipeline. DocETL introduces an agent-based framework to rewrite user-specified pipelines into alternative ones, as shown in Figure 1. Rather than simply relying on agents as-is, which can be error-prone, we guide them to rewrite query plans using novel rewrite directives that we identify. We call these directives instead of rules because they are abstract guidelines interpreted by LLMs based on task and data characteristics, with infinitely many concrete instantiations. We further leverage an agentic framework to evaluate the resulting pipelines. Since evaluation can be expensive, we develop an optimization approach inspired by Cascades (Graefe, 1995), where we use a top-down rule-based strategy to generate and evaluate a space of equivalent plans, opting to opportunistically decompose (or rewrite) complex or error-prone operations into simpler ones.
+
+DocETL is open-source and available on GitHub222https://github.com/ucbepic/docetl. As of November 2024, it has already amassed 1.3k+ GitHub stars, and has been used for pipelines ranging from domain-specific analysis (e.g., legal, climate science) to enterprise and personal productivity (e.g., analyzing customer support tickets, emails); over 300 users have joined the corresponding Discord server.
+
+Overall, finding optimal complex data processing pipelines is impossible given the infinite search space, non-determinism of LLMs, fuzziness of text, and ambiguity in task-specific success criteria. However, even in these difficult settings, DocETL is able to produce pipelines that are sufficiently accurate for practical needs, as is evidenced by our adoption across domains. DocETL is able to do so by leveraging the power of LLM agents in constrained ways, in conjunction with a powerful, but compact set of rewrite directives, decomposition into processing units that can be validated, as well as an opportunistic top-down exploration of the search space.
+
+We make the following contributions in this paper:
+
+  1. (1)
+
+Novel Rewrite Directives and Agent-Driven Rewriting: We identify 13 new rewrite directives designed for LLM-based operators, addressing challenges unique to complex document processing. Unlike traditional rewrite rules, LLM agents are used to implement these directives. When a rule applies to a portion of a pipeline, agents synthesize appropriate prompts and parameters for new operations. For example, when decomposing a “summarize instances of misconduct” operation into multiple ones, an agent might create two steps: first, “list instances of misconduct given specific types (e.g., excessive force),” followed by “summarize each listed instance,” crafting suitable prompts for each new operation.
+
+  2. (2)
+
+Agent-Driven Plan Assessment: We also use LLM agents to synthesize task-specific validation prompts for each operation, which are used to assess output quality. For instance, to verify a misconduct summary, an agent might create a prompt, “Does this summary include all instances of misconduct from the document?” Or, “Do all mentioned instances actually exist in the document?” The agents then execute plans on sample data and evaluate outputs using these custom prompts. This entire process happens without the user having to provide or manually validate examples.
+
+  3. (3)
+
+Opportunistic Sub-plan Optimization: Unlike traditional query optimizers that generate and evaluate a broad range of possible plans (Chaudhuri, 1998), we leverage an opportunistic top-down search strategy as shown in Figure 1: when we use a rewrite directive to decompose operators into new ones, we immediately optimize each new operator. We first check if each such operator is sufficiently accurate, based on the validation as described previously. If sufficiently accurate, we no longer optimize that operator, focusing instead on rewriting others. Thus, we opportunistically decompose (or apply rewrite directives to) operators that are not sufficiently accurate, Such an approach is necessary because enumerating and evaluating all theoretically-possible plans would be prohibitively time-consuming due to the inherent latencies in LLM operations.
+
+We describe DocETL’s programming model and operators in Section 2; our new LLM-centric rewrite directives in Section 3, the agentic optimizer that applies them, and evaluates the resulting plans, as well as the overall framework for optimization in Section 4. We present our initial evaluation in Section 5, where we demonstrate that across four unstructured document analysis tasks, DocETL finds plans that are 25 to 80% more accurate than baselines. We then reflect on next steps in Section 6, and discuss related work in Section 7.
+
+##  2\. DocETL DSL and Operators
+
+This section presents DocETL’s programming model and operators.
+
+###  2.1. Programming Model
+
+DocETL processes collections of documents. A document comprises a set (or dictionary) of key (or equivalently, attribute)-value pairs, represented as a JSON object. For example, a police record could be a set of key-value pairs, where one key corresponds to the OCR output of the PDF, while other keys could capture metadata such as responding agency, file name, or creation date. A collection of documents or dataset, is a JSON array. This data representation lets us flexibly handle various data types and degrees of structure and easily reference data within operation prompts. Documents can be nested, e.g., a police record may contain an array of related_documents that each contain witness statements or evidence logs that are further nested.
+
+DocETL DSL. DocETL employs YAML as its domain-specific language (DSL) to define data processing pipelines, for several reasons. First, YAML is flexible in accommodating complex multi-line prompts and examples, as well as output schemas and validation mechanisms, while intermixing formatting with arguments in Jinja (Pallets, 2024). Second, YAML is human-readable and doesn’t require extensive coding expertise. Third, it is commonly used in industry for describing data pipelines (Apache Airflow, dbt, Prefect) and services (Kubernetes, Docker, Circle/Gitlab CI/CD). Finally, YAML serves as a simple intermediate format for representing the DocETL-optimized pipelines for human inspection, as well as for our no-code interface, where users will provide data and natural language descriptions, with DocETL generating optimized pipelines. That said, our optimization techniques are not dependent on YAML and are also applicable to other frameworks.
+
+DocETL Pipelines. A DocETL pipeline, expressed in YAML, describes a sequence of operations. Each operation specifies its operator type, input source, prompt template, and output schema. The input source can be either the original dataset or the output of a previous operator. We refer to this input using pre-defined variables input or inputs depending on whether the input cardinality is one or many. A global default model can be specified, and individual operators can override this setting. The pipeline begins with dataset definitions, which serves as the initial input. As operators process data, they generate output obeying their schemas, which subsequent operators can then use. This structure allows for flexible and modular pipeline composition. DocETL supports a default model for the entire pipeline, with the option for per-operation model specifications.
+
+Fault Tolerance. When executing an LLM-powered operator for many input documents in a pipeline, some operations may occasionally fail to adhere to the given prompt. While prior work assumes reliability in LLM outputs (Anderson et al., 2024; Liu et al., 2024b; Patel et al., 2024), DocETL explicitly addresses this variability: for each operator, users can specify validations as Python statements that evaluate to true or false, referencing document and output attributes. If any validation fails, the operation retries, using context from the failure to improve the likelihood of success in subsequent attempts.
+
+Table 1. DocETL’s operator suite, divided into operators that leverage LLMs for semantic processing and auxiliary operators (∗) that handle data manipulation. For each operator, we show the required user configuration and a high-level description of its functionality. Operator | User Configuration |  Description  
+---|---|---  
+Map | Prompt, output schema |  Uses an LLM to execute a transformation per document, adding resulting new keys to the schema (and optionally omitting existing ones).  
+Parallel Map | Multiple prompts, output schemas |  Uses an LLM to execute multiple independent transformations on each document in parallel, adding the new keys to the schema.  
+Reduce | Group-by keys, prompt, output schema |  Uses an LLM to aggregate groups of documents sharing the same key values into one new document per distinct value.  
+Filter | Prompt returning boolean |  Uses an LLM to evaluate a condition per document, retaining only those where the condition is true.  
+Resolve | Comparison prompt, resolution prompt |  Uses an LLM to identify values for a given key(s) that fuzzily match across documents and generate canonical versions per group of values, replacing them in-place in the documents.  
+Equijoin | Comparison prompt |  Uses an LLM to determine if pairs of documents from two datasets should be joined based on fuzzy/semantic matching of the corresponding keys.  
+Unnest* | Array/dict field to unnest |  Flattens nested data structures by either creating separate documents from array elements or merging nested dictionary fields into parent documents.  
+Split* | Split key, chunk size |  Divides documents into smaller chunks based on token count or other criteria, creating as many new docs as there are chunks.  
+Gather* | Context window configuration |  Augments each chunk with context from surrounding chunks based on specified configuration (e.g., previous and next chunk counts), keeping the set of documents the same.  
+  
+###  2.2. LLM-Powered Operators
+
+Here, we describe the LLM-powered operators in DocETL and any specific implementation details for executing them with LLMs. Table 1 summarizes our operators; detailed syntax can be found in our documentation333https://www.docetl.org/. Most operators are LLM-versions of classic data processing operators, however, we introduce a new resolve operator, used to canonicalize variations in specific attribute values. In the following, for succinctness of description, we often conflate a document—a JSON object comprising key-value pairs and the basic unit of processing in a dataset with its textual content, typically a value for a specific key within the JSON object.
+
+####  2.2.1. Map
+
+The map operator applies an LLM-powered projection, also known as a semantic projection, to each document in the dataset. Let’s consider an example of a map operation:
+
+⬇
+
+type: map
+
+output:
+
+schema:
+
+misconduct: ”list[{officer_name: str, misconduct_instance: str}]”
+
+prompt: | 
+
+Analyze the following police record:
+
+{{ input.document }}
+
+Extract any instances of officer misconduct or procedural violations. For each instance, provide:
+
+1. The name of the officer involved
+
+2. A brief description of the misconduct or violation
+
+This operation processes each document independently, using the specified prompt. The output schema is a list of key-value pairs (of officer names and misconduct instances). This flexible, semi-structured output format allows for varying numbers of misconduct instances per document. DocETL supports prompts using Jinja2 templates, where “{{ input.document }}” allows for insertion of the current document’s content. This functionality permits complex prompts with conditional logic (as we will see later). When applied, the map operation adds the new attributes specified in the output schema to the existing document. Users can override this behavior and return a subset of attributes by specifying a drop_keys list.
+
+DocETL also supports parallel maps, where multiple independent transformations can be applied in parallel to each document. For example, one may extract misconduct while another summarizes relevant policies. Each operation enriches input documents with new attributes and can run in parallel rather than serially. While users could technically use a map to specify a parallel map, in many cases, they already have prompt templates corresponding to two or more independent tasks on the same dataset, and this allows them to not have to coalesce their prompts together.
+
+####  2.2.2. Reduce
+
+The reduce operator aggregates information across multiple documents based on a set of user-specified keys, ultimately producing one output document per unique combination of attribute values. This operation is particularly useful for consolidating information spread across multiple related documents. For instance, for reducing police reports, the key set might include officer_name and incident_date, allowing for the grouping of all reports involving a specific officer on a particular date. Users can define prompt templates that access the grouped documents via {{ inputs }} (a list of documents sharing the same key values) and the specific key values for the current group via {{ reduce_key }}. By default, reduce operations are assumed to be associative, meaning that the order in which documents are processed does not affect the result. However, if the order is significant, users can specify associative: False in the operation definition.
+
+A challenge arises when any given group of documents is too large for the LLM to correctly process. One could use folding or hierarchical merging to process the data in manageable batches (Condie et al., 2010; Gupta et al., 1993). In folding, each input is serially processed, with an update to an accumulator (or aggregate), while hierarchical merging recursively aggregates inputs in a tree-like structure. DocETL currently implements a batched folding approach that starts with an empty accumulator and sequentially folds in batches of more than one document at a time. We chose folding because it permits non-associative reduce operations and maintains the original order of inputs. For example, when summarizing a textbook chapter, DocETL may chunk the text into sections(where a chunk is a portion of text that an LLM can reliably process), summarize each one, and then employ reduce to summarize the section summaries—a process that requires preserving the original reading order. DocETL automatically determines an optimal fold batch size when building the pipeline.
+
+To implement folding, users can provide (or DocETL can generate) a separate fold_prompt, which references the accumulated output and a batch of new inputs to fold into that output. We enhance the system prompt to allow the LLM to write extra notes to a scratchpad (Nye et al., 2021)—a technique that has been shown to improve accuracy by allowing it to maintain state. During each LLM call, we provide the current scratchpad along with the accumulated output and new inputs. The LLM returns both the updated accumulated output and scratchpad, which are passed to the next fold operation. Figure 2 depicts folding for a task to identify names of people mentioned more than once across documents. The scratchpad tracks all mentions of names. As each batch is processed, the LLM updates the scratchpad with new mentions and adds to the accumulated output any person now mentioned more than once.
+
+Figure 2. Reduce’s iterative folding over 3 batches of documents. Each batch takes several documents and the current scratchpad as input (left), and updates the mention counts in the scratchpad and accumulated output of entities mentioned multiple times (right).
+
+####  2.2.3. Resolve
+
+This operator canonicalizes one or more keys across documents that represent slight variations of the same entity. for subsequent grouping and aggregation. Here, resolve reconciles small variations in officer names extracted as part of the map described in Section 2.2.1:
+
+⬇
+
+type: resolve
+
+comparison_prompt: —
+
+Compare the following two officers from police records:
+
+Officer 1: {{ input1.officer_name }} mentioned in: {{ input1.record_txt }} and Officer 2: {{ input2.officer_name }} mentioned in: {{ input2.record_txt }}
+
+Are these names likely referring to the same officer?
+
+resolution_prompt: —
+
+The following names correspond to the same officer:
+
+{% for input in inputs %}
+
+Name: {{ entry.officer_name }}
+
+{% endfor %}
+
+Provide an officer name (first and last) that best represents all the matched entries.
+
+output:
+
+schema:
+
+officer_name: string
+
+The user simply specifies how to detect variations, and how to canonicalize them. For instance, “comparison_prompt” checks whether two officer names are the same, while “resolution_prompt” chooses a canonical officer name from a list. DocETL then uses these prompts to compare and resolve the officer names. After this operation, the number of documents stays the same. The output schema specifies attributes to replace or add (if new) to each document. Resolve often follows unnest (Section 2.3.1), which flattens nested data structures. For example, in our police misconduct pipeline, after unnesting, each document would have distinct officer_name and misconduct_instance keys, allowing for name resolution across all mentions in the dataset. Note that users don’t need to explicitly define the resolve operation in their pipeline; DocETL will automatically synthesize them if needed to ensure consistent entity references across the dataset. We will discuss how DocETL assesses the benefit of such rewrites in Section 4.1.
+
+####  2.2.4. Other Operators
+
+While expressible using map and reduce, the following operators are added for convenience. We plan to add other operators (e.g., sort) in the future. Filter retains documents based on a condition specified in an LLM prompt, which uses a Jinja2 template referencing one or more document keys. Equijoin joins two datasets by comparing documents in pairs, using a comparison_prompt designed to elicit a binary answer from the LLM, referencing the documents as left and right. The equijoin operation doesn’t require an output schema, as the left and right documents are merged to produce the results.
+
+###  2.3. Auxiliary Operators
+
+We present three essential operators that are not powered by LLMs, used as auxiliary steps to express complex tasks.
+
+Figure 3. Split-Gather Pipeline: Illustration of processing a single long document. The split operation divides a long document into manageable chunks. The gather operation then augments each chunk with relevant context from peripheral chunks. The image demonstrates three different ways of rendering chunk 3 (i.e., three different gather configurations): (i) including fractional parts of surrounding chunks, (ii) including the full content of the first chunk, and (iii) including summaries of all previous chunks.
+
+####  2.3.1. Unnest
+
+The unnest operator expands an array or dictionary into individual elements. For example, if a map extracts multiple officer names from police interrogation transcripts, each document may contain an array of names. To analyze officers individually across multiple interrogations, unnest creates a separate document for each officer name, effectively flattening the data. This operation can also elevate attributes from nested dictionaries, making them directly accessible for downstream processing.
+
+####  2.3.2. Split
+
+The split operator divides long text into smaller chunks. It requires a split key (the text attribute), a split method (token or delimiter), and method-specific parameters (e.g., delimiter or chunk size). An example is as follows:
+
+⬇
+
+type: split
+
+split_key: document_text
+
+method: token_count
+
+method_kwargs:
+
+num_tokens: 1000
+
+The above operation splits the document_text attribute into chunks of 1000 tokens each. The split operation produces several output attributes per chunk:
+
+  1. (1)
+
+The <split_key>_chunk attribute contains the chunk content. Here, the chunk content is stored in document_text_chunk.
+
+  2. (2)
+
+The <operation_name>_id attribute contains a unique identifier assigned to each original document (before splitting). In this case, it would be doc_splitter_id. All chunks from the same original document share the same ID.
+
+  3. (3)
+
+The <operation_name>_chunk_num attribute contains the sequential number of each chunk within its original document. Here, it would be doc_splitter_chunk_num.
+
+These additional attributes, particularly the document ID and chunk number, are used in downstream gather operations, to reassemble or process the chunks in context. New documents (the result of the split operation) inherit the other attributes from the original documents.
+
+####  2.3.3. Gather
+
+The gather operation complements the split operation by augmenting individual chunks with peripheral information necessary for understanding the chunk’s content. Conceptually, gather is similar to windowing in SQL, as both allow ordered access to data beyond the current row or chunk, but gather is specifically designed for LLM-based processing. For example, in a transcript split into chunks, a chunk containing pronouns (e.g., “he” or “she”) may lack speaker names, making it hard to understand. Gather allows flexible configuration of which peripheral context to include with each chunk, such as:
+
+⬇
+
+type: gather
+
+content_key: document_text_chunk
+
+peripheral_chunks:
+
+previous:
+
+head:
+
+count: 1
+
+content_key: document_text_chunk
+
+middle:
+
+content_key: document_text_chunk_summary
+
+This particular configuration includes the full content of the document’s first chunk, summaries of intermediate chunks, and the current chunk itself. Figure 3 demonstrates different ways to render chunks. The gather operation is highly flexible in rendering contextual information, allowing for the inclusion of full chunks (as in (ii)), portions of chunks (as in (i)), or transformations (e.g., summaries) of chunks (as in (iii)). Importantly, there may be map operations between the split and gather steps—allowing for the generation of additional context (such as summaries) that can be used to augment each chunk, before downstream processing.
+
+The output adds a new attribute to each input document, containing the rendered chunk with its peripheral context, with with special tags that demarcate what is the chunk and what is peripheral context. This approach ensures that each chunk is processed with necessary context, maintaining the coherence and structure of the original document even when split across multiple chunks. For additional details, see Appendix A.
+
+##  3\. Rewrite Directives
+
+We now introduce the rewrite directives that DocETL currently supports. We call these directives to indicate that they are abstract frameworks, with somewhat ambiguous semantics, that can be concretely instantiated by LLM agents in a multitude of ways, as opposed to rules, which are more concrete, complete, and robust. These directives are primarily designed to optimize the quality of outputs from DocETL pipelines through logical decomposition of individual operations. We focus on rewrite directives for map, reduce, and equijoin operators, with filter operators also supported through the application of map rewrite directives.We organize our rewrite directives into three main categories: data decomposition, projection synthesis, and LLM-centric improvements.
+
+Throughout this section, we adopt the following notation: given operators A𝐴Aitalic_A and B𝐵Bitalic_B, we denote their composition as A→B→𝐴𝐵A\to Bitalic_A → italic_B, where (A→B)⁢(D)=B⁢(A⁢(D))→𝐴𝐵𝐷𝐵𝐴𝐷(A\to B)(D)=B(A(D))( italic_A → italic_B ) ( italic_D ) = italic_B ( italic_A ( italic_D ) ). For independent execution of operators, we use A∥Bconditional𝐴𝐵A\parallel Bitalic_A ∥ italic_B to indicate that A𝐴Aitalic_A and B𝐵Bitalic_B are executed on the same input, independent of each other. For readability, we may drop arguments—e.g., Mapx⁢(D)subscriptMap𝑥𝐷\text{Map}_{x}(D)Map start_POSTSUBSCRIPT italic_x end_POSTSUBSCRIPT ( italic_D ) becomes MapxsubscriptMap𝑥\text{Map}_{x}Map start_POSTSUBSCRIPT italic_x end_POSTSUBSCRIPT. Similarly, we omit subscripts except when the same operator appears in multiple places. We further refer to the text content of the document, usually stored as one of the attributes, interchangeably with the document itself, for simplicity.
+
+As mentioned previously, the actual instantiation and application of these directives are carried out by LLMs, which interpret the directives in the context of specific tasks and data. The benefits of each directive are also assessed by LLMs, as we can’t know in advance if a directive will be helpful in a given situation. LLM agents evaluate the potential impact of each directive based on task requirements (i.e., prompts) and data characteristics, as we will discuss in Section 4. Next, we cover each category of directives.
+
+###  3.1. Data Decomposition
+
+Data decomposition is crucial when dealing with large documents, or when there are too many documents to fit in a prompt and get an accurate result for. We present two categories of rewrite directive here: document chunking and multi-level aggregation.
+
+####  3.1.1. Document Chunking (Map)
+
+Large documents often exceed LLM context windows or effective reasoning capabilities, leading to incomplete or inconsistent results. Our primary rewrite directive for this case, which we call the split directive, is:
+
+(1) |  | MapxsubscriptMap𝑥\displaystyle\text{Map}_{x}Map start_POSTSUBSCRIPT italic_x end_POSTSUBSCRIPT | ⇒(2)⁢Split→(3)Gather→(4)Mapy→(5)Reduce⇒absent(2)absentSplit(3)→Gather(4)→subscriptMap𝑦(5)→Reduce\displaystyle\Rightarrow\overset{\text{{\color[rgb]{0,0,1}\definecolor[named]{% pgfstrokecolor}{rgb}{0,0,1}(\ref{eq:splitmap})}}}{\hskip 14.22636pt}\text{% Split}\xrightarrow{\text{{\color[rgb]{0,0,1}\definecolor[named]{pgfstrokecolor% }{rgb}{0,0,1}(\ref{eq:summarization})}}}\text{Gather}\xrightarrow{\text{{% \color[rgb]{0,0,1}\definecolor[named]{pgfstrokecolor}{rgb}{0,0,1}(\ref{eq:% filtergather})}}}\text{Map}_{y}\xrightarrow{\text{{\color[rgb]{0,0,1}% \definecolor[named]{pgfstrokecolor}{rgb}{0,0,1}(\ref{eq:unnest})}}}\text{Reduce}⇒ over() start_ARG end_ARG Split start_ARROW over() → end_ARROW Gather start_ARROW over() → end_ARROW Map start_POSTSUBSCRIPT italic_y end_POSTSUBSCRIPT start_ARROW over() → end_ARROW Reduce |   
+---|---|---|---|---  
+  
+Ignoring the blue annotations, this directive rewrites map to: split the document into multiple chunks, gather peripheral context for each chunk, apply a modified map operation per chunk, and reduce the results. The prompt for MapysubscriptMap𝑦\text{Map}_{y}Map start_POSTSUBSCRIPT italic_y end_POSTSUBSCRIPT may explicitly state that only a portion of the original document is being processed.
+
+To provide more flexibility and optimization opportunities, we introduce smaller decomposition directives, for steps (2)–(5) above:
+
+(2) |  | Split | ⇒Map→Split⇒absentMap→Split\displaystyle\Rightarrow\text{Map}\to\text{Split}⇒ Map → Split |   
+---|---|---|---|---  
+(3) |  | Split→Gather→SplitGather\displaystyle\text{Split}\to\text{Gather}Split → Gather | ⇒Split→(Maps∥Maph)→Gather⇒absentSplit→conditionalsubscriptMap𝑠subscriptMapℎ→Gather\displaystyle\Rightarrow\text{Split}\to(\text{Map}_{s}\parallel\text{Map}_{h})% \to\text{Gather}⇒ Split → ( Map start_POSTSUBSCRIPT italic_s end_POSTSUBSCRIPT ∥ Map start_POSTSUBSCRIPT italic_h end_POSTSUBSCRIPT ) → Gather |   
+(4) |  | Gather | ⇒Gather→Filter⇒absentGather→Filter\displaystyle\Rightarrow\text{Gather}\to\text{Filter}⇒ Gather → Filter |   
+(5) |  | Gather→Map→GatherMap\displaystyle\text{Gather}\to\text{Map}Gather → Map | ⇒Gather→Map→Unnest⇒absentGather→Map→Unnest\displaystyle\Rightarrow\text{Gather}\to\text{Map}\to\text{Unnest}⇒ Gather → Map → Unnest |   
+  
+When splitting a document, three types of context prove particularly useful: document-level metadata, hierarchical information, and summaries of neighboring chunks. The smaller decomposition directives address these and other aspects of document processing:
+
+  * •
+
+Document-Level Metadata Extraction (2): This directive introduces a map immediately prior to splitting, enabling the extraction of metadata relevant to all chunks. For example, when analyzing a legal contract, we might extract the contract date and parties involved from the first page, passing this information to every chunk to be rendered as part of a subsequent gather.
+
+  * •
+
+Header Lineage Context and Summarization (3): This directive introduces two parallel map operations: MaphsubscriptMapℎ\text{Map}_{h}Map start_POSTSUBSCRIPT italic_h end_POSTSUBSCRIPT for extracting hierarchical information (e.g., headers), and MapssubscriptMap𝑠\text{Map}_{s}Map start_POSTSUBSCRIPT italic_s end_POSTSUBSCRIPT for generating summaries of chunks. This allows us to provide each chunk with its relevant hierarchical context (e.g., parent headers for headers in a chunk) and/or a summary of preceding content.
+
+  * •
+
+Chunk Filtering (4): Not all parts of a document may be relevant for processing. This directive introduces a filter step after gathering context, allowing us to exclude irrelevant chunks. This filter can be inferred; for instance, when processing a scientific paper, we might filter out acknowledgments or references sections if they’re not pertinent to the analysis task; but they could still be used as context for other chunks if needed.
+
+  * •
+
+Flattening Nested Results (5): When processing chunks with gathered context, map might produce nested results. This directive introduces an unnest operation to flatten these results, simplifying downstream processing. For example, if each chunk produces a list of extracted entities, unnesting would flatten these lists into a single collection of entities across all chunks.
+
+####  3.1.2. Multi-Level Aggregation (Reduce)
+
+Large-scale aggregations can benefit from a hierarchical approach, aggregating data at a finer granularity before rolling up to the desired level. This decomposition is based on a semantic hierarchy in the data:
+
+(6) |  | ReduceK,x⇒ReduceK∪K′,y→ReduceK,z⇒subscriptReduce𝐾𝑥subscriptReduce𝐾superscript𝐾′𝑦→subscriptReduce𝐾𝑧\text{Reduce}_{K,x}\Rightarrow\text{Reduce}_{K\cup K^{\prime},y}\to\text{% Reduce}_{K,z}Reduce start_POSTSUBSCRIPT italic_K , italic_x end_POSTSUBSCRIPT ⇒ Reduce start_POSTSUBSCRIPT italic_K ∪ italic_K start_POSTSUPERSCRIPT ′ end_POSTSUPERSCRIPT , italic_y end_POSTSUBSCRIPT → Reduce start_POSTSUBSCRIPT italic_K , italic_z end_POSTSUBSCRIPT |   
+---|---|---|---  
+  
+Here K𝐾Kitalic_K is the reduce key, e.g., K={state}𝐾{state}K={\small\texttt{\\{state\\}}}italic_K = {state}, and K′superscript𝐾′K^{\prime}italic_K start_POSTSUPERSCRIPT ′ end_POSTSUPERSCRIPT represents additional keys for finer granularity, e.g., K′={city}superscript𝐾′{city}K^{\prime}={\small\texttt{\\{city\\}}}italic_K start_POSTSUPERSCRIPT ′ end_POSTSUPERSCRIPT = {city}. y𝑦yitalic_y and z𝑧zitalic_z are LLM-powered aggregations for the sub-reduce and final reduce operations. For example, when summarizing voting patterns by state from social media posts, we might first aggregate data by state and city (Reduce{state,city},ysubscriptReducestatecity𝑦\text{Reduce}_{\\{\text{\tt state},\text{\tt city}\\},y}Reduce start_POSTSUBSCRIPT { state , city } , italic_y end_POSTSUBSCRIPT), then combine these city-level summaries to the state level (Reduce{state},zsubscriptReducestate𝑧\text{Reduce}_{\\{\text{\tt state}\\},z}Reduce start_POSTSUBSCRIPT { state } , italic_z end_POSTSUBSCRIPT). This approach can capture nuances that might be lost in a single, large-scale aggregation, and allows for intermediate validation. The effectiveness of this rewrite depends on the specific nature of the data and the aggregation task—the LLM agent must consider the appropriate granularity and design effective prompts for both aggregation steps.
+
+###  3.2. LLM-Centric Improvements
+
+This category addresses unique behaviors of LLMs that can be leveraged for optimization. We present two categories of rewrite directive: gleaning and duplicate resolution.
+
+####  3.2.1. Gleaning (Map and Reduce)
+
+Figure 4. Gleaning process with k=1𝑘1k=1italic_k = 1 round of refinement. An LLM initially extracts information from an input transcript, and Officer Y is missing from the output. A validation agent (LLM-powered) identifies this omission and provides feedback. The original LLM incorporates this feedback in a second pass (shown with purple arrows), resulting in a more complete final output that includes both Officer X and Officer Y.
+
+For this directive, we rely on the insight that when prompted with the previous inputs and outputs, and asked to improve the outputs, an LLM can iteratively refine the output. While iterative refinement has been implemented for knowledge graph entity extraction (Edge et al., 2024), we generalize this concept into a rewrite directive applicable to any map or reduce task. Our approach, which we call gleaning, employs separate data processing and validator LLM steps to iteratively improve output quality. We formalize the gleaning process for map operations as:
+
+(7) |  | Map⇒Map→(Mapv→Mapi)≤k⇒MapMap→superscript→subscriptMap𝑣subscriptMap𝑖absent𝑘\text{Map}\Rightarrow\text{Map}\to(\text{Map}_{v}\to\text{Map}_{i})^{\leq k}Map ⇒ Map → ( Map start_POSTSUBSCRIPT italic_v end_POSTSUBSCRIPT → Map start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT ) start_POSTSUPERSCRIPT ≤ italic_k end_POSTSUPERSCRIPT |   
+---|---|---|---  
+  
+Here, k𝑘kitalic_k represents the maximum number of refinement iterations, MapvsubscriptMap𝑣\text{Map}_{v}Map start_POSTSUBSCRIPT italic_v end_POSTSUBSCRIPT is a validation operation, and MapisubscriptMap𝑖\text{Map}_{i}Map start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT is a refinement operation. The process works as follows:
+
+  1. (1)
+
+Init: run the original map on the input document.
+
+  2. (2)
+
+Eval: separate validator (MapvsubscriptMap𝑣\text{Map}_{v}Map start_POSTSUBSCRIPT italic_v end_POSTSUBSCRIPT) checks output based on original prompt, init’s output, and a task-specific validation prompt. The validator determines if refinement is needed and describes how to improve the output, if so.
+
+  3. (3)
+
+Refine: we use a refinement map (MapisubscriptMap𝑖\text{Map}_{i}Map start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT) to improve the previous iteration’s output based on validator feedback. Importantly, this step retains the chat history, including the original prompt, its previous response, and the validator’s feedback, so it can iteratively refine.
+
+  4. (4)
+
+Iterate: repeat up to k𝑘kitalic_k times, or no further refinement is needed.
+
+A similar approach can be applied to reduce operations:
+
+(8) |  | Reduce⇒Reduce→(Mapv→Reducei)≤k⇒ReduceReduce→superscript→subscriptMap𝑣subscriptReduce𝑖absent𝑘\text{Reduce}\Rightarrow\text{Reduce}\to(\text{Map}_{v}\to\text{Reduce}_{i})^{% \leq k}Reduce ⇒ Reduce → ( Map start_POSTSUBSCRIPT italic_v end_POSTSUBSCRIPT → Reduce start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT ) start_POSTSUPERSCRIPT ≤ italic_k end_POSTSUPERSCRIPT |   
+---|---|---|---  
+  
+For reduce operations, the refinement is applied at the level of a group, not to individual documents. This enables consideration of the collective context of the grouped data.
+
+####  3.2.2. Duplicate Key Resolution (Reduce)
+
+A big challenge in LLM-powered data processing is that grouping, aggregation, and summarization is difficult due to the fact that LLM outputs are not canonicalized, and may contain many semantic duplicates. To address semantic duplicates in reduce keys, especially those derived from LLM-powered operations, we introduce resolve operations:
+
+(9) |  | ReduceK,x⇒(Resolvek1⁢‖…‖⁢Resolvekm)→ReduceK,x⇒subscriptReduce𝐾𝑥subscriptResolvesubscript𝑘1norm…subscriptResolvesubscript𝑘𝑚→subscriptReduce𝐾𝑥\text{Reduce}_{K,x}\Rightarrow(\text{Resolve}_{k_{1}}\parallel\ldots\parallel% \text{Resolve}_{k_{m}})\to\text{Reduce}_{K,x}Reduce start_POSTSUBSCRIPT italic_K , italic_x end_POSTSUBSCRIPT ⇒ ( Resolve start_POSTSUBSCRIPT italic_k start_POSTSUBSCRIPT 1 end_POSTSUBSCRIPT end_POSTSUBSCRIPT ∥ … ∥ Resolve start_POSTSUBSCRIPT italic_k start_POSTSUBSCRIPT italic_m end_POSTSUBSCRIPT end_POSTSUBSCRIPT ) → Reduce start_POSTSUBSCRIPT italic_K , italic_x end_POSTSUBSCRIPT |   
+---|---|---|---  
+  
+Where {k1,…,km}⊆Ksubscript𝑘1…subscript𝑘𝑚𝐾\\{k_{1},\ldots,k_{m}\\}\subseteq K{ italic_k start_POSTSUBSCRIPT 1 end_POSTSUBSCRIPT , … , italic_k start_POSTSUBSCRIPT italic_m end_POSTSUBSCRIPT } ⊆ italic_K are each a disjoint subset of keys to be resolved. Each ResolvekisubscriptResolvesubscript𝑘𝑖\text{Resolve}_{k_{i}}Resolve start_POSTSUBSCRIPT italic_k start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT end_POSTSUBSCRIPT operation consolidates semantically equivalent values for the key kisubscript𝑘𝑖k_{i}italic_k start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT. We introduce this rewrite directive to address the inherent variability in LLM outputs: when LLMs are used to generate keys for reduce operations, they may produce semantically equivalent but syntactically different values. For example, “New York City,” “NYC,” and “The Big Apple” might all refer to the same entity. Without resolution, these would be treated as separate keys, leading to inaccurate aggregations.
+
+###  3.3. Projection Synthesis
+
+Projection synthesis strategies are inspired by projection pushdown optimizations in database systems. While selections (and selection pushdown) can also be synthesized, we did not implement this, as we found that agents are not very effective at determining whether certain data could be relevant to the query (they are overly biased by prompt wording and tend to be overly inclusive). Moreover, since an LLM-based selection is just as costly as a map, as both require an LLM call for every document, we focused on map operations that shrink the size of documents through a form of projection. With LLM agents, we can dynamically synthesize projections to “push down” based on the specific task and data at hand. However, programming LLM agents to synthesize these effectively is not straightforward, as there are potentially infinite projections that could be synthesized without necessarily improving pipeline accuracy or output quality. We present several instances of projection synthesis directives:
+
+(10) |  | MapxsubscriptMap𝑥\displaystyle\text{Map}_{x}Map start_POSTSUBSCRIPT italic_x end_POSTSUBSCRIPT | ⇒Mapx1→Mapx2→⋯→Mapxn⇒absentsubscriptMapsubscript𝑥1→subscriptMapsubscript𝑥2→⋯→subscriptMapsubscript𝑥𝑛\displaystyle\Rightarrow\text{Map}_{x_{1}}\to\text{Map}_{x_{2}}\to\cdots\to% \text{Map}_{x_{n}}⇒ Map start_POSTSUBSCRIPT italic_x start_POSTSUBSCRIPT 1 end_POSTSUBSCRIPT end_POSTSUBSCRIPT → Map start_POSTSUBSCRIPT italic_x start_POSTSUBSCRIPT 2 end_POSTSUBSCRIPT end_POSTSUBSCRIPT → ⋯ → Map start_POSTSUBSCRIPT italic_x start_POSTSUBSCRIPT italic_n end_POSTSUBSCRIPT end_POSTSUBSCRIPT |   
+---|---|---|---|---  
+(11) |  | MapysubscriptMap𝑦\displaystyle\text{Map}_{y}Map start_POSTSUBSCRIPT italic_y end_POSTSUBSCRIPT | ⇒(Mapy1⁢‖Mapy2‖⁢⋯∥Mapym)→Reduce⇒absentconditionalsubscriptMapsubscript𝑦1normsubscriptMapsubscript𝑦2⋯subscriptMapsubscript𝑦𝑚→Reduce\displaystyle\Rightarrow(\text{Map}_{y_{1}}\parallel\text{Map}_{y_{2}}% \parallel\cdots\parallel\text{Map}_{y_{m}})\to\text{Reduce}⇒ ( Map start_POSTSUBSCRIPT italic_y start_POSTSUBSCRIPT 1 end_POSTSUBSCRIPT end_POSTSUBSCRIPT ∥ Map start_POSTSUBSCRIPT italic_y start_POSTSUBSCRIPT 2 end_POSTSUBSCRIPT end_POSTSUBSCRIPT ∥ ⋯ ∥ Map start_POSTSUBSCRIPT italic_y start_POSTSUBSCRIPT italic_m end_POSTSUBSCRIPT end_POSTSUBSCRIPT ) → Reduce |   
+(12) |  | ReduceK,xsubscriptReduce𝐾𝑥\displaystyle\text{Reduce}_{K,x}Reduce start_POSTSUBSCRIPT italic_K , italic_x end_POSTSUBSCRIPT | ⇒Mapy→ReduceK,z⇒absentsubscriptMap𝑦→subscriptReduce𝐾𝑧\displaystyle\Rightarrow\text{Map}_{y}\to\text{Reduce}_{K,z}⇒ Map start_POSTSUBSCRIPT italic_y end_POSTSUBSCRIPT → Reduce start_POSTSUBSCRIPT italic_K , italic_z end_POSTSUBSCRIPT |   
+(13) |  | EquijoinxsubscriptEquijoin𝑥\displaystyle\text{Equijoin}_{x}Equijoin start_POSTSUBSCRIPT italic_x end_POSTSUBSCRIPT | ⇒(Mapy,L∥Mapz,R)→Equijoinw⇒absentconditionalsubscriptMap𝑦𝐿subscriptMap𝑧𝑅→subscriptEquijoin𝑤\displaystyle\Rightarrow(\text{Map}_{y,L}\parallel\text{Map}_{z,R})\to\text{% Equijoin}_{w}⇒ ( Map start_POSTSUBSCRIPT italic_y , italic_L end_POSTSUBSCRIPT ∥ Map start_POSTSUBSCRIPT italic_z , italic_R end_POSTSUBSCRIPT ) → Equijoin start_POSTSUBSCRIPT italic_w end_POSTSUBSCRIPT |   
+  
+  * •
+
+Chaining (10): This directive chains simpler projections for complex map operations, useful when a map prompt contains multiple instructions. Each MapxisubscriptMapsubscript𝑥𝑖\text{Map}_{x_{i}}Map start_POSTSUBSCRIPT italic_x start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT end_POSTSUBSCRIPT builds on the previous result. For example, a legal document analysis could involve chained steps: extract clauses, summarize, and generate recommendations.
+
+  * •
+
+Isolating (11): For map operations with independent subtasks, this directive splits them into separate projections to run in parallel, followed by a reduce step. For instance, customer feedback analysis could involve parallel projections to classify sentiment, identify features, and flag urgent issues.
+
+  * •
+
+Pre-Aggregation (12): This directive filters and projects relevant data from each document before a reduce operation, improving both efficiency and the quality of the aggregation. For example, when summarizing shipping-related feedback by product category, each detailed review could first be projected into a concise summary of shipping comments, before aggregation.
+
+  * •
+
+Pre-Joining (13): For complex equijoin operations, this directive preprocesses documents before joining. It is useful when direct comparison is computationally expensive—for example, matching research papers to funding opportunities could involve projecting papers to a short list of key themes and funding descriptions to criteria before joining.
+
+One may wonder why each operator has its own directive (e.g., map before reduce, map before equijoin). This is because the criteria for applying the directive differ by operator. For example, in pre-joining, the LLM agent evaluates factors like the sufficiency of current keys and long/large attributes. If beneficial, it generates a prompt to create a new key-value pair for a more relevant data representation. Similarly, for other operators, the agent considers operator-specific factors to determine the directive’s applicability.
+
+Overall, our rewrite directives reflect our key insight: in complex document processing tasks, it is impossible to determine an optimal pipeline given the infinite search space, difficulty, and ambiguity. Rewrite directives provide a scaffold for systematically exploring this space, especially when coupled with opportunistic decomposition into problematic operations (as will be described in subsequent sections). The effectiveness of specific directives varies by context and is hard to predict—we plan to study their relative utility in future work. Finally, as a byproduct of this search process to find sufficiently accurate pipelines, we obtain interpretable pipelines, since the operators use natural language prompts.
+
+##  4\. Optimizer
+
+Here, we detail DocETL’s query planning and optimization process. Users define their pipeline in a pipeline.yaml file, then run docetl build pipeline.yaml to generate a new YAML file with an optimized pipeline. DocETL’s optimization involves two types of agents: Generation agents, which apply logical rewrite directives to create candidate plans (see “Apply Rewrites (Agent)” boxes in Figure 1), and Validation agents, which generate custom prompts to assess the quality of these plans. Per operation or sub-pipeline, validation agents evaluate candidate sub-plans on a data sample to select the optimal one, as shown by the green (selected) and gray (evaluated but not selected) sub-plans in Figure 1; we will describe both steps next. Our framework is reminiscent of top-down approaches like Cascades (Graefe, 1995), but differs in its expansion criterion (using directives) and sub-plan evaluation via LLM-based validation. Unlike traditional cost-based optimizers, we focus on accuracy, with cost and latency constraints to be addressed in future work.
+
+###  4.1. Optimization Approach
+
+DocETL employs a top-down optimization approach that considers both individual operations and sub-pipelines, as outlined in Algorithm 1 and visualized in Figure 1. Intuitively, we move from left to right, opting (recursively) to decompose any operations for which the accuracy is inadequate (as determined by the LLM validators). The process can be summarized as follows:
+
+  1. (1)
+
+Pipeline Traversal and Sub-pipeline Identification: We iterate through the pipeline from input to output (left to right). For each operation, we consider whether it, along with a suffix of the already-optimized operations to its left, forms a sub-pipeline that matches any rewrite directive. If no matching sub-pipeline is found, we treat the current operation as a single-operation sub-pipeline to optimize. For each identified sub-pipeline:
+
+     * •
+
+We use the validation agent to synthesize a custom validation prompt tailored to the specific task described by the sub-pipeline.
+
+     * •
+
+The validation agent examines a sample of outputs using this prompt to determine if there’s room for improvement. If the agent concludes that the current implementation is satisfactory, we move on to the next operation without further optimization, as shown by the no-change (“NC”) paths in Figure 1.
+
+This process is outlined in Algorithm 1, and the initial validation step is shown in Algorithm 2 (lines 5-7).
+
+  2. (2)
+
+Rewrite Directive Application and Recursive Optimization: When optimization is needed, we apply matching rewrite directives to the sub-pipeline or individual operation. As illustrated in Figure 1, we explore various rewrite directives from Section 3. For each applicable directive, an LLM agent synthesizes new operations and configurations (e.g., prompts, output schemas) to match the directive. When new operations are created, we immediately optimize them, recursively, before continuing with the current optimization, as shown by the nested “Apply Rewrites” rectangles in the figure. This opportunistic approach allows us to explore more refined plans efficiently (Algorithm 2, lines 10-11).
+
+  3. (3)
+
+Plan Evaluation and Selection: Multiple candidate plans can arise from the rewrite directives, as depicted by the various branches in Figure 1. We employ a two-stage evaluation process to select the best plan, as described in Algorithm 3: First, we execute each plan on a sample of data and use the validation agent to rate the output for each document, computing an average rating per plan. We then select the top k𝑘kitalic_k rated plans (currently set to 6) for further comparison. Next, the agent performs pairwise comparisons between these top plans, evaluating their outputs against each other. The plan with the most “wins” in these comparisons is selected as the optimal plan for the current sub-pipeline or operation, represented by the green boxes in Figure 1. This hybrid approach balances efficiency and accuracy in plan evaluation, as pairwise comparisons are known to be ideal for assessing relative quality (Parameswaran et al., 2024; Liu et al., 2024c), but with potentially 100+ candidate plans generatedby various rewrite directives (each rewrite can have multiple candidate plans, e.g., different parallel projections synthesized), comparing all pairs becomes computationally infeasible.
+
+  4. (4)
+
+Pipeline Update: We integrate the selected optimized plan into the overall pipeline, replacing the original operation or sub-pipeline (Algorithm 1, lines 9-12).
+
+Input: Pipeline P𝑃Pitalic_P (sequence of operators), Sample data D𝐷Ditalic_D
+
+Output: Optimized pipeline Po⁢p⁢tsubscript𝑃𝑜𝑝𝑡P_{opt}italic_P start_POSTSUBSCRIPT italic_o italic_p italic_t end_POSTSUBSCRIPT
+
+1
+
+2 Function  _OptimizePipeline(_P,D𝑃𝐷P,Ditalic_P , italic_D_)_:
+
+3 o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d←[]←𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑optimized\leftarrow[]italic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d ← [ ];
+
+4 foreach  _operation o⁢p∈P𝑜𝑝𝑃op\in Pitalic_o italic_p ∈ italic_P_ do
+
+5 if  _o⁢p.n⁢e⁢e⁢d⁢s⁢C⁢o⁢n⁢f⁢i⁢gformulae-sequence𝑜𝑝𝑛𝑒𝑒𝑑𝑠𝐶𝑜𝑛𝑓𝑖𝑔op.needsConfigitalic_o italic_p . italic_n italic_e italic_e italic_d italic_s italic_C italic_o italic_n italic_f italic_i italic_g_ then
+
+// Use LLM agent to synthesize config for new ops created by rewrite directives, including prompts, output schemas, and operator-specific parameters (e.g., reduce_key for reduce)
+
+6 o⁢p.c⁢o⁢n⁢f⁢i⁢g←formulae-sequence𝑜𝑝←𝑐𝑜𝑛𝑓𝑖𝑔absentop.config\leftarrowitalic_o italic_p . italic_c italic_o italic_n italic_f italic_i italic_g ← GenerationAgent.SynthesizeConfig(o⁢p𝑜𝑝opitalic_o italic_p);
+
+7
+
+8 if  _([([( [_suffix of_ optimized]→op)optimized]\to op)italic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d ] → italic_o italic_p ) _matches a rewrite directive__ then
+
+9 subplan←[subplan\leftarrow[italic_s italic_u italic_b italic_p italic_l italic_a italic_n ← [matching suffix of optimized]→opoptimized]\to opitalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d ] → italic_o italic_p;
+
+10 o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d⁢_⁢s⁢u⁢b←←𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑_𝑠𝑢𝑏absentoptimized\\_sub\leftarrowitalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d _ italic_s italic_u italic_b ← OptimizeSubPipeline(s⁢u⁢b⁢p⁢l⁢a⁢n,D𝑠𝑢𝑏𝑝𝑙𝑎𝑛𝐷subplan,Ditalic_s italic_u italic_b italic_p italic_l italic_a italic_n , italic_D);
+
+11 Replace matching suffix of o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑optimizeditalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d with o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d⁢_⁢s⁢u⁢b𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑_𝑠𝑢𝑏optimized\\_subitalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d _ italic_s italic_u italic_b;
+
+12
+
+13 else
+
+14 o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d⁢_⁢s⁢u⁢b←←𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑_𝑠𝑢𝑏absentoptimized\\_sub\leftarrowitalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d _ italic_s italic_u italic_b ← OptimizeSubPipeline([o⁢p],Ddelimited-[]𝑜𝑝𝐷[op],D[ italic_o italic_p ] , italic_D);
+
+15 Append o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d⁢_⁢s⁢u⁢b𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑_𝑠𝑢𝑏optimized\\_subitalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d _ italic_s italic_u italic_b to o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑optimizeditalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d;
+
+16
+
+17 end if
+
+18
+
+19 end foreach
+
+20 return o⁢p⁢t⁢i⁢m⁢i⁢z⁢e⁢d𝑜𝑝𝑡𝑖𝑚𝑖𝑧𝑒𝑑optimizeditalic_o italic_p italic_t italic_i italic_m italic_i italic_z italic_e italic_d;
+
+21
+
+22
+
+23
+
+Algorithm 1 Pipeline Optimization
+
+1
+
+Input: Sub-pipeline S⁢P𝑆𝑃SPitalic_S italic_P, Sample data D𝐷Ditalic_D
+
+Output: Optimized sub-pipeline S⁢Po⁢p⁢t𝑆subscript𝑃𝑜𝑝𝑡SP_{opt}italic_S italic_P start_POSTSUBSCRIPT italic_o italic_p italic_t end_POSTSUBSCRIPT
+
+2
+
+3 Function  _OptimizeSubPipeline(_S⁢P,D𝑆𝑃𝐷SP,Ditalic_S italic_P , italic_D_)_:
+
+4 if  _S⁢P𝑆𝑃SPitalic_S italic_P _does not match any rewrite directive__ then
+
+5 return S⁢P𝑆𝑃SPitalic_S italic_P;
+
+6
+
+7 Execute S⁢P𝑆𝑃SPitalic_S italic_P on D𝐷Ditalic_D to get outputs;
+
+// Synthesize a prompt for validating sub-pipeline output
+
+8 V←←𝑉absentV\leftarrowitalic_V ← ValidationAgent.SynthesizeValidatorPrompt(D𝐷Ditalic_D, outputs, S⁢P𝑆𝑃SPitalic_S italic_P);
+
+9 if  _ValidationAgent.Validate(outputs, V𝑉Vitalic_V) _is satisfactory__ then
+
+10 return S⁢P𝑆𝑃SPitalic_S italic_P;
+
+11
+
+12 c⁢a⁢n⁢d⁢i⁢d⁢a⁢t⁢e⁢_⁢p⁢l⁢a⁢n⁢s←[]←𝑐𝑎𝑛𝑑𝑖𝑑𝑎𝑡𝑒_𝑝𝑙𝑎𝑛𝑠candidate\\_plans\leftarrow[]italic_c italic_a italic_n italic_d italic_i italic_d italic_a italic_t italic_e _ italic_p italic_l italic_a italic_n italic_s ← [ ];
+
+13 foreach  __directive_ R∈𝑅absentR\initalic_R ∈ _applicable rewrite directives for_ S⁢P𝑆𝑃SPitalic_S italic_P_ do
+
+// R applied to SP generates a mix of old and new ops
+
+14 r⁢e⁢w⁢r⁢i⁢t⁢t⁢e⁢n⁢_⁢o⁢p⁢s←←𝑟𝑒𝑤𝑟𝑖𝑡𝑡𝑒𝑛_𝑜𝑝𝑠absentrewritten\\_ops\leftarrowitalic_r italic_e italic_w italic_r italic_i italic_t italic_t italic_e italic_n _ italic_o italic_p italic_s ← R𝑅Ritalic_R applied to S⁢P𝑆𝑃SPitalic_S italic_P;
+
+15 p⁢l⁢a⁢n←←𝑝𝑙𝑎𝑛absentplan\leftarrowitalic_p italic_l italic_a italic_n ← OptimizePipeline(_r⁢e⁢w⁢r⁢i⁢t⁢t⁢e⁢n⁢_⁢o⁢p⁢s,D𝑟𝑒𝑤𝑟𝑖𝑡𝑡𝑒𝑛_𝑜𝑝𝑠𝐷rewritten\\_ops,Ditalic_r italic_e italic_w italic_r italic_i italic_t italic_t italic_e italic_n _ italic_o italic_p italic_s , italic_D_);
+
+16 Append p⁢l⁢a⁢n𝑝𝑙𝑎𝑛planitalic_p italic_l italic_a italic_n to c⁢a⁢n⁢d⁢i⁢d⁢a⁢t⁢e⁢_⁢p⁢l⁢a⁢n⁢s𝑐𝑎𝑛𝑑𝑖𝑑𝑎𝑡𝑒_𝑝𝑙𝑎𝑛𝑠candidate\\_plansitalic_c italic_a italic_n italic_d italic_i italic_d italic_a italic_t italic_e _ italic_p italic_l italic_a italic_n italic_s;
+
+17
+
+18 end foreach
+
+19 return PlanSelection⁢(c⁢a⁢n⁢d⁢i⁢d⁢a⁢t⁢e⁢_⁢p⁢l⁢a⁢n⁢s,V,D,k)PlanSelection𝑐𝑎𝑛𝑑𝑖𝑑𝑎𝑡𝑒_𝑝𝑙𝑎𝑛𝑠𝑉𝐷𝑘\text{PlanSelection}(candidate\\_plans,V,D,k)PlanSelection ( italic_c italic_a italic_n italic_d italic_i italic_d italic_a italic_t italic_e _ italic_p italic_l italic_a italic_n italic_s , italic_V , italic_D , italic_k );
+
+20
+
+21
+
+22
+
+Algorithm 2 Sub-pipeline Optimization
+
+Input: Candidate plans C𝐶Citalic_C, Validation prompt V𝑉Vitalic_V, Sample data D𝐷Ditalic_D, Number of top plans to compare k𝑘kitalic_k
+
+Output: Best plan b⁢e⁢s⁢t⁢_⁢p⁢l⁢a⁢n𝑏𝑒𝑠𝑡_𝑝𝑙𝑎𝑛best\\_planitalic_b italic_e italic_s italic_t _ italic_p italic_l italic_a italic_n
+
+1 foreach  __plan_ p∈C𝑝𝐶p\in Citalic_p ∈ italic_C_ do
+
+2 Execute p𝑝pitalic_p on each sample in D𝐷Ditalic_D;
+
+3 Use ValidationAgent to rate outputs on a scale of 1 (very bad) to 4 (no identified improvements) according to V𝑉Vitalic_V;
+
+4 Compute average score for p𝑝pitalic_p across samples;
+
+5
+
+6 end foreach
+
+7Select top k𝑘kitalic_k plans based on average scores;
+
+8 foreach  __pair of plans_ (pi,pj)subscript𝑝𝑖subscript𝑝𝑗(p_{i},p_{j})( italic_p start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT , italic_p start_POSTSUBSCRIPT italic_j end_POSTSUBSCRIPT ) _in top k𝑘kitalic_k plans__ do
+
+9 Perform pairwise comparison using ValidationAgent and V𝑉Vitalic_V;
+
+10 Update comparison scores for pisubscript𝑝𝑖p_{i}italic_p start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT and pjsubscript𝑝𝑗p_{j}italic_p start_POSTSUBSCRIPT italic_j end_POSTSUBSCRIPT;
+
+11
+
+12 end foreach
+
+13return plan with highest comparison score;
+
+Algorithm 3 Plan Selection
+
+To execute candidate plans (so we can compare their outputs), we sample data based on document size (larger documents have higher selection probability). As we optimize each sub-pipeline, we track its selectivity ratio (output documents / input documents) and use these ratios to adjust sample sizes for later operations. For example, if the first two operations have selectivities of 0.5 and 0.3, we increase the initial sample size by (1/0.5/0.3)≈6.6710.50.36.67(1/0.5/0.3)\approx 6.67( 1 / 0.5 / 0.3 ) ≈ 6.67 when optimizing the third operation. This ensures sufficient data for optimization even after selective operations. However, sample documents may not fully represent the complete dataset; e.g., if the sampled documents fit within LLM context limits but some documents in the full dataset exceed them, we may encounter errors during full execution. We are developing methods to adapt plans accordingly during pipeline execution time.
+
+Our overall approach lends itself to a rich space of pipeline optimization techniques with operator reordering and operator fusion. While we have not implemented any in the current release of DocETL, we are actively exploring this area for future improvements.
+
+###  4.2. Agent and System Implementation
+
+Here, we outline our novel agent-based architecture for generation and validation. While a comprehensive analysis of our architectures is beyond the scope of this paper, we focus on critical aspects that significantly impact system performance and effectiveness.
+
+####  4.2.1. Generation Agents
+
+Generation agents are responsible for applying rewrite directives to create diverse candidate plans. When presented with a directive, these agents synthesize one or more appropriate operation configurations. These configurations encompass both logical and physical choices. Logical choices include prompts, output schemas, and reduce keys, while physical choices involve parameters such as chunk sizes for document splitting and batch sizes for document reduction. The generation agent also evaluates the applicability of rewrite directives in specific contexts. For instance, the agent might determine that applying the split-map directive (Equation 2) is not beneficial if there’s no valuable document-level metadata to leverage when processing individual chunks.
+
+For certain parameter choices, particularly those related to physical implementation, LLMs may not be well-suited to determine optimal values. For example, how would an LLM know the ideal number of documents to summarize together in a batch as part of a reduce operation? In these cases, we use heuristics to generate a range of plausible parameter values, such as different batch sizes for a reduce operation, and then compare the results of these plans to determine the most effective parameter choice for the given operation and context.
+
+Here, we detail three examples of our generation agent’s approach for parameter selection:
+
+Chunk Sizes. Our chunking approach explores sizes ranging from 20% to 80% of the LLM’s context limit. For each chunk size, we generate a set of gather configurations to retain relevant context from surrounding chunks. The creation of these gather configurations is based on the ratio of chunk size to document size.
+
+We begin with three base configurations of gather operations for each chunk size: no context, one previous chunk, and one previous plus one next chunk. We then expand this set based on the document-to-chunk size ratio. For larger ratios (indicating smaller chunks relative to the document size), we generate configurations with more peripheral context. We use a square root function to control the growth of peripheral context as the document-to-chunk ratio increases, preventing excessive context that could overwhelm the model. The choice of square root is based on empirical observations that the benefit of additional context tends to diminish more drastically as more context is added—a detailed evaluation is left for future work. For example, if the document is significantly larger than the chunk size, our expanded set might include configurations with up to 5 previous chunks and 2 next chunks. Conversely, for ratios closer to 1 (where chunk size approaches document size), our set comprises only the base configurations.
+
+This basic approach is a first attempt at systematically exploring various chunking and gathering strategies. We are currently developing a taxonomy of LLM-powered data processing tasks to further refine this process. Our goal is to eventually use task classification to guide the generation of more tailored chunk sizes and gather configurations, recognizing that optimal settings may vary significantly depending on the specific task at hand.
+
+Batch Sizes. For reduce operations, optimal batch sizes (i.e., the number of documents aggregated at once, in a single prompt) are not obvious and require experimentation. Our agent tests sizes from 20% to 100% of the maximum input fitting the LLM’s context window, generating and evaluating multiple fold prompts for each. Our evaluations reveal task-dependent optimal batch sizes, highlighting the need for further research in this area—some tasks perform best with the smallest batch size (e.g., extracting distinct names), while others peak at a middle batch size, as shown in Section 5.
+
+Blocking Keys and Rules. Resolve and equijoin operators involve pairwise comparisons between entities or records, leading to quadratic complexity in LLM calls. To mitigate this, a common technique is to use blocking to filter the number of pairs (Christophides et al., 2020). DocETL offers two blocking approaches: embedding-based and code-based. Embedding-based blocking leverages an embedding model (default: OpenAI’s text-embedding-3-small) to generate vector representations for each document or subset of key-value pairs in a document (i.e., blocking keys). We compute cosine similarities between these embeddings and only consider pairs whose similarity exceeds a specified threshold for full LLM-based comparison. Code-based blocking allows custom Python expressions to be specified as filters. While blocking keys and code-based blocking rules can be directly constructed by the generation agents, we employ a different approach for determining the embedding threshold. Instead of asking an LLM to arbitrarily come up with a similarity threshold, we empirically determine it: first, we sample hundreds of pairs that are likely to be duplicates based on their embedding similarity. We then execute the comparison prompt on these pairs to identify the true duplicates. Finally, we select the threshold that achieves 95% recall in duplicate identification.
+
+####  4.2.2. Validation Agents
+
+Validation agents assess sub-pipeline effectiveness through a structured validation and comparison process. For each operator, they synthesize validation criteria focused on concrete properties like accuracy (correctness of extracted information), precision (avoiding hallucinated content), and recall (completeness of extracted information), rather than relying on the operation’s prompt instructions. These criteria are formulated as explicit tests that can be systematically checked against operation outputs.
+
+To evaluate operation outputs, the agents first process a sample of data and assess the outputs against the synthesized validation criteria. This assessment determines whether further optimization is needed based on concrete failures rather than subjective assessment. When comparing candidate plans, the agents employ a two-stage approach: first rating each plan’s outputs on a scale from 1 (very bad) to 5 (excellent) based on how well they meet the validation criteria, then performing detailed pairwise comparisons between the top-k𝑘kitalic_k rated plans for a more nuanced quality assessment, as described in Algorithm 3. We currently set k=6𝑘6k=6italic_k = 6 to balance thorough evaluation with computational efficiency, though we leave a more systematic parameter selection strategy for future work.
+
+This structured approach to validation enables us to identify specific failure modes and guide the optimization process toward concrete improvements, similar to how traditional software testing isolates bugs through specific test cases. The validation criteria serve as a consistent benchmark across different pipeline variants, allowing for reliable comparison of alternative plans.
+
+####  4.2.3. Implementation Details
+
+DocETL leverages GPT-4o (OpenAI) as the default LLM for both generation and validation agents, but this can be changed by the user. Both generation and validation agents consider a variety of inputs in their prompts, including user-defined operation prompts, sample operation input data, and, when relevant (i.e., for evaluation), sample operation output data. Often, including all of this data in a single prompt exceeds the LLM’s context limits. When this happens, we have to remove information from the prompt. We prioritize keeping the following types of information:
+
+  1. (1)
+
+_Output Schema Attributes_ : These are given the highest priority, with all tokens included—which is feasible because LLM output limits are typically much smaller than prompt (i.e., input) limits.
+
+  2. (2)
+
+_Prompt-Referenced Attributes_ : Of next priority is input attributes explicitly referenced in the prompt template, ensuring the LLM has access to all task-critical information.
+
+  3. (3)
+
+_Remaining Input Attributes_ : For any additional attributes in the input document(s), we implement a middle truncation strategy. This method preserves both the initial and final portions of the content, which often encapsulate key information, while judiciously truncating the middle sections as necessary.
+
+To optimize performance and resource utilization, we cache all sub-pipeline outputs. The engine and optimizer are implemented in approximately 16K lines of Python, with 2K lines in Rust for efficient resolve and equijoin execution. While blocking rules are defined in Python, so they can be easily generated by LLMs, we implement common patterns (like containment and normalized string matching) in Rust for better performance. Structured outputs for LLM calls are handled by the tool calling functionality; users can use any LLM in DocETL pipelines that supports tool calling (e.g., OpenAI, Claude, Gemini, Llama 3.1, and more).
+
+##  5\. Evaluation
+
+The primary goal in our evaluation is show that DocETL’s rewrite directives and optimization framework dramatically enhance our ability to automatically analyze complex documents—all with no training labels or developer intervention needed. While finding optimal plans is impossible, we demonstrate that DocETL’s approach of systematically decomposing tasks and documents to explore a search space of processing strategies yields plans that are sufficiently accurate. In comparison, baseline approaches often achieve such poor accuracy (¡ 40%) that they are impractical for real use.
+
+Overall, we find that DocETL’s plans yield 25% to 55% improvements in task-specific accuracy metrics such as precision, recall, and F1 score. We first consider three complex document processing tasks: legal contract analysis, declassified article analysis, and video game review analysis. These tasks represent different challenges: extracting structured information embedded within the semantic content of unstructed data, resolving entities and summarizing their information across documents, and reasoning about temporal consistency across long documents. For the first task, we compare against LOTUS (Patel et al., 2024) and Palimpzest (Liu et al., 2024b), both recent preprints. We exclude these systems from the second and third tasks as they lack support for entity resolution and long documents (i.e., resolve, split, gather). We additionally evaluate DocETL on the challenging Biodex text classification (D’Oosterlinck et al., 2023) from the LOTUS paper, their only task with sub-70% accuracy, thereby benefiting from accuracy optimization. On this task, DocETL’s optimized pipeline achieves 33 to 80% improvements in rank precision compared to LOTUS. Finally, we report on a case study of applying DocETL to police misconduct, as well as anecdotes from open-source users.
+
+For all pipelines, we use the gpt-4o-mini model from OpenAI, and we run the experiments on a 2021 Macbook Pro with an M1 chip. The DocETL optimizer uses gpt-4o-mini, except in the police misconduct task in Section 5.5, where we use gpt-4o.
+
+###  5.1. Legal Contract Analysis
+
+The Contract Understanding Atticus Dataset (CUAD) (Hendrycks et al., 2021), includes 510 legal contracts with expert-labeled annotations across 41 categories of clauses, ranging from basic information (e.g., Document Name, Parties) to complex concepts (e.g., Most Favored Nation, IP Ownership, Post-Termination Services). The task is to extract text spans for each relevant clause type from each contract; not all contracts contain all types of clauses.
+
+We evaluate on a subset, the first 50 contracts, comparing extracted clauses against ground truth. An extraction is considered correct if (i) the clause type matches the ground truth, and (ii) the extracted text span has a Jaccard similarity greater than a specific threshold (set as >0.15absent0.15>0.15> 0.15) with the ground truth span. This similarity threshold accommodates variation in LLM outputs while ensuring the model has correctly identified the clause’s location; it is set fairly low because we provide no training examples, so the LLM does not know how little or how much to extract—but large enough to ensure some match. We set other values for this and found the comparisons to be similar. We measure precision, recall, and F1.
+
+####  5.1.1. Implementations
+
+We have three baselines:
+
+  1. (1)
+
+DocETL Baseline: Our unoptimized pipeline consists of a single map with a prompt to extract all relevant clauses, given one-sentence descriptions of the 41 clause types. The output schema specifies a list of objects with clause_type and text_span keys.
+
+⬇
+
+type: map
+
+output:
+
+schema:
+
+misconduct: ”list[{clause_type: str, text_span: str}]”
+
+prompt: —
+
+Given the following contract document:
+
+{{ input.document }}
+
+Extract the text spans (if they exist) for each of the following categories:
+
+1. Document Name: The name of the contract
+
+2. Parties: The two or more parties who signed the contract
+
+3. Agreement Date: The date of the contract
+
+4. Effective Date: The date when the contract is effective
+
+…37 more…
+
+  2. (2)
+
+LOTUS Baseline: We implement a pipeline using LOTUS’s sem_map operator with the same prompt as DocETL’s map operation, plus additional output structuring instructions since LOTUS does not support explicit output schema definitions. The LOTUS pipeline output is a string that we parse into JSON for evaluation. While some outputs required re-running to obtain parseable JSON, we report costs for a single run to maintain fair comparison. We expect the accuracies for the LOTUS baseline to be similar to the DocETL baseline, as the LLM calls are mostly the same; the only differences arise from discrepancies in the system prompts (part of the DocETL and LOTUS codebases; not exposed to the user), as well as the extra instruction in the LOTUS prompt to output a JSON-formatted answer matching the intended schema (which contains examples of some of the clause types).
+
+  3. (3)
+
+Palimpzest Baseline: We implement the extraction using Palimpzest’s convert operator. In Palimpzest, rather than writing prompts directly, users provide schema descriptions from which the system generates prompts. We provided our clause type descriptions in the description of the schema.
+
+  4. (4)
+
+DocETL’s Optimized Plan: DocETL’s optimizer transforms the single map operation into a parallel decomposition with 21 map operations, each extracting 1-3 semantically related spans (e.g., grouping agreement and effective date extractions), followed by a reduce to combine all extracted clauses. Notably, the optimizer chose parallel decomposition (directive 11) over document chunking, suggesting that LLMs excel at focused extraction of small amounts of information even from lengthy documents.
+
+####  5.1.2. Results
+
+The results are shown in Table 2. DocETL’s optimized plan performs significantly better than all baselines, achieving a 25.1% improvement in F1 and 54.5% improvement in recall over LOTUS, the next best plan. LOTUS and the unoptimized DocETL pipeline achieve similar scores, as neither method employs any accuracy optimization. Interestingly, Palimpzest’s optimizer selected a code-based plan rather than an LLM-based one for this task, despite selecting the maxQuality plan. Palimpzest’s lower performance on this specific task may be due to difficulties in configuring its schema-only approach.
+
+While the optimized pipeline’s cost and runtime are higher (Table 3), we prioritize accuracy, which often requires increased computational costs. The higher runtime and cost stems from the increased number of LLM calls in the parallel map operations, plus an additional reduce operation to combine their results. Further parallelism could help reduce the runtimes further, but this is not our focus. Costs will decrease as LLM pricing continues to fall—they have fallen by 1000×\times× in 3 years, with a predicted drop of 10×\times× per year (Appenzeller, 2024)—and they become negligible when using open-source models. The optimization cost is only $1.58 (using gpt-4o-mini for the optimizer’s agents) and does not increase with dataset size, as it is done on a sample.
+
+Table 2. Legal Contract Analysis Results System | Avg Precision | Avg Recall | Avg F1  
+---|---|---|---  
+DocETL (Unopt.) | 0.305 | 0.451 | 0.364  
+DocETL (Opt.) | 0.394 | 0.731 | 0.474  
+LOTUS | 0.350 | 0.473 | 0.379  
+Palimpzest | 0.059 | 0.013 | 0.022  
+Table 3. Runtime and Cost Analysis for Legal Task. N/A means not available, because the pipeline or system does not have an optimizer. Palimpzest runtime is single-threaded and includes optimization time.
+
+System | Runtime (s) | Cost ($) | Optimizer Cost ($)  
+---|---|---|---  
+DocETL (Unopt.) | 23.43 | 0.10 | N/A  
+DocETL (Opt.) | 180.30 | 1.70 | 1.58  
+LOTUS | 28.12 | 0.07 | N/A  
+Palimpzest | 84.07 |  Unknown∗ |  Unknown∗  
+  
+∗Palimpzest uses DSPy (Khattab et al., 2024) which makes LLM calls opaque, preventing cost tracking.
+
+###  5.2. Game Review Analysis
+
+Table 4. Game Review Analysis Results Metric | Baseline | Optimized  
+---|---|---  
+Hallucination Rate (lower is better) | 0.465 | 0.312  
+Sentiment Accuracy (higher is better) | 0.664 | 0.650  
+Kendall’s Tau (higher is better) | 0.470 | 0.631  
+  
+We evaluate DocETL on temporal analysis of video game reviews from Steam444https://www.kaggle.com/datasets/najzeko/steam-reviews-2021. For each of 10 popular games (randomly sampled from the 100 games with the most reviews), we create a document with 300 customer reviews with timestamps (but omit their ratings). Each document comprises concatenated reviews in no particular order, with lengths exceeding standard LLM context windows. The task is to identify 10 positive and 10 negative reviews per game, with their review IDs, and present these in chronological order. We evaluate the pipelines on: (i) hallucination rate, or the fraction of extracted review IDs that do not appear in the source, (ii) sentiment accuracy: whether the identified review sentiment matches the user’s rating, computed only for non-hallucinated reviews, and (iii) Kendall’s Tau correlation of the timestamp ordering, which measures how well the reviews are chronologically ordered.
+
+####  5.2.1. Implementations
+
+Since the documents exceed context limits and require temporal reasoning, we do not compare against existing systems, which do not support documents beyond context windows. Our baseline DocETL pipeline consists of a single map to extract positive_reviews and negative_reviews (both list types), with documents truncated from the middle to fit the context window—effectively randomly sampling reviews from each game’s corpus. The operation looks like the following:
+
+⬇
+
+type: map
+
+output:
+
+schema:
+
+positive_reviews: ”list[{review_id: str, timestamp: str, review_summary: str}]”
+
+negative_reviews: ”list[{review_id: str, timestamp: str, review_summary: str}]”
+
+prompt: —
+
+Given the following reviews for the game {{ input.app_name }}, analyze them and select 10 positive and 10 negative reviews that are evenly distributed across time:
+
+{{ input.concatenated_reviews }}
+
+Return two lists:
+
+- positive_reviews: List of 10 positive reviews, sorted by timestamp
+
+- negative_reviews: List of 10 negative reviews, sorted by timestamp
+
+Each returned review object should contain the review ID, timestamp and a summary of the review.
+
+DocETL’s optimizer transforms this pipeline into: (a) A split operation that chunks input by token count (104,652 tokens per chunk): no gather operation (b) Two map operations per chunk—one each for positive/negative reviews—each incorporating one round of gleaning (directive 7) to ensure that the reviews are valid (c) A reduce operation to combine the positive and negative reviews from the chunks and present them in chronological order, matching the original get_reviews operation’s output schema.
+
+####  5.2.2. Results
+
+As in Table 4, the optimized pipeline significantly reduced hallucinations and improved temporal ordering. We observe a 32.9% reduction in hallucination rate (from 46.5% to 31.2%), demonstrating more reliable review extraction. Sentiment accuracy remained relatively stable (66.4% vs 65.0%), suggesting that improved extraction did not come at the cost of sentiment classification quality. We also have a 34.3% improvement in Kendall’s Tau (from 0.470 to 0.631), i.e., better temporal ordering.
+
+The optimized pipeline costs $1.48 (173.63s runtime) versus the baseline’s $0.12 (29.27s). However, the baseline achieves this by truncating data to fit LLM context limits. With full data processing, the baseline would cost $0.28, making the optimized pipeline 5.3×5.3\times5.3 × more expensive—still less than the 10×10\times10 × cost gap between gpt-4o and gpt-4o-mini models. This cost increase is justified by the improved temporal reasoning accuracy, and is due to steps like gleaning (which doubles operation cost); however, the gleaning validator consistently flagged temporal issues; in nearly all instances, the validator provided feedback like “The … reviews are not sorted correctly by timestamp; they should be organized chronologically.” And, as mentioned previously, costs are dropping precipitously. The optimization cost was $6.60; however, this is a one-time cost.
+
+###  5.3. Declassified Article Analysis
+
+We evaluate DocETL’s effectiveness on resolve and reduce tasks using 733 paranormal case files from The Black Vault, a repository of declassified international government documents, averaging 700 words each. Each article documents a reported paranormal event with details such as location and witness accounts. We scraped articles from their website and used Azure Document Intelligence to convert any PDF attachments to text, and provide this data for transparency.555https://osf.io/9xsbq Our task is to determine the distinct locations for each type of paranormal event (e.g., all cities and regions where UFO sightings were reported). The task involves two challenges: (i) standardizing event types across articles, and (ii) extracting and aggregating location mentions across articles for each event type.
+
+We evaluated precision of extracted locations by first programatically verifying their presence in the source text and attempting to geocode them using the Nominatim API, based on OpenStreetMap. For locations in the text that could not be geocoded (e.g., specific rivers or mountain ranges), we performed manual verification.
+
+####  5.3.1. Implementations
+
+We consider 3 pipelines. We only consider one baseline, written in DocETL, as other systems don’t have a resolve operator. This pipeline consists of: (i) a map to extract the event type (e.g., “humanoid sighting”) per article, and (ii) a reduce to aggregate distinct locations across all articles of each event type.
+
+DocETL’s optimizer modified this pipeline in two ways. First, it synthesized a resolve between map and reduce to standardize event types (directive 9). Second, it optimized reduce by determining an appropriate fold batch size (41) to process document batches, synthesizing the corresponding fold prompts. The optimized pipeline consists of: (i) a map (as before), (ii) a resolve to standardize event types (e.g., variations of “UFO sighting”), and (iii) a reduce (as before), but using a batched fold, with batch size 41.
+
+To isolate the impact of the optimized reduce operation, we also evaluate the a version of this pipeline (+resolve only), which uses the original reduce operation without batched folding.
+
+####  5.3.2. Results
+
+Table 5. Declassified Article Analysis Results. Location metrics for baseline are N/A as its 233 distinct event types (mostly singleton categories) make meaningful location aggregation impossible. Metric | Baseline | +Resolve Only | Optimized  
+---|---|---|---  
+Location Precision | N/A | 0.994 | 1.000  
+Location Recall | N/A | 298 | 435  
+Distinct Event Types | 164 | 83 | 83  
+  
+As shown in Table 5, the baseline pipeline extracts 233 distinct event types with many semantic duplicates (e.g., “UFO Sighting”, “Category: UFO Sighting”, “Event Type: UFO Sighting”), making location aggregation impractical as most event types contain only one article. Adding resolve enables meaningful aggregation by consolidating to 83 event types. The +resolve only pipeline extracts 298 locations with 99.4% precision, and the optimized pipeline further improves this to 100% precision while extracting 435 locations (46% higher recall). This improved recall arises because batched folding allows the LLM to incrementally process and track distinct locations, rather than attempting to process all documents at once, where important details may be lost due to LLM context window overload (Levy et al., 2024; Liu et al., 2024a).
+
+Cost Analysis. The resolve-only pipeline cost $1.16 (307.36s runtime), while the optimized version cost $1.34 (625.64s runtime), plus $0.50 for optimization. The longer runtime for the optimized pipeline stems from using multiple LLM calls per event type during folding, compared to the resolve-only version which makes just one LLM call to process all documents per event type. For all operations, and the optimizer agents, we used gpt-4o-mini.
+
+###  5.4. Biomedical Classification
+
+We evaluate DocETL and LOTUS (Patel et al., 2024) on a challenging biomedical drug reaction classification task (D’Oosterlinck et al., 2023), introduced in the LOTUS preprint. For each of 250 biomedical papers, the task involves identifying which out of a canonical list, called the MedDRA list, of 24,300 adverse drug reactions, are discussed, amounting to a multi-label classification problem. Performance is measured using rank-precision@k (RP@k), evaluating both the accuracy of identified reactions and their ranking—a higher score indicates that true positive reactions appear earlier in the list.
+
+####  5.4.1. Implementations
+
+For LOTUS, we report numbers from their preprint. In addition, to evaluate against LOTUS on an equal footing using the same models (gpt-4o-mini for LLM calls, text-embedding-3-small for embeddings), maintaining similar LLM call budgets (12k calls), we modified their codebase to replicate the hand-written pipeline from their preprint to our best ability. We present these numbers as well.
+
+LOTUS Baseline. While LOTUS’s paper describes an efficient map-search-filter pattern to implement semantic joins, their codebase (as of November 2024) implements joins as a simple nested loop that invokes an LLM for every tuple pair with the user-defined natural language predicate; i.e., “The article {left:article} indicates that the patient is experiencing the {right:reaction}” in our case. This would require over 6 million LLM calls on our dataset, which is prohibitively expensive. Therefore, we implemented their described map-search-filter pattern ourselves as a pandas dataframe accessor: first extracting reactions from each article via a map operation, then using similarity search to find candidate MedDRA labels, and finally filtering these candidates with an LLM to verify matches.
+
+Our implementation follows their described pipeline with some necessary deviations. First, a map operation extracts drug reactions from each article (one LLM call per article). Then, for each article’s extracted reactions, we find the 49 nearest neighbors in embedding space among the MedDRA labels—we chose k=49 to match our target LLM call budget (∼12⁢ksimilar-toabsent12𝑘\sim 12k∼ 12 italic_k, equivalent to the number of LLM calls executed by DocETL). While LOTUS uses FAISS for similarity search (Douze et al., 2024), we encountered segmentation faults with their implementation. We instead use exact cosine similarity computation via NumPy, which may slightly increase runtime but provides more precise results—though this overhead is minimal given we only search through O(10k) vectors per article on an M1 Mac. Our filter operation has access to the full article text rather than just the map operation output, making our implementation generous to LOTUS.
+
+To evaluate rank-precision, we post-processed the pipeline outputs into ranked lists. For each article, we ranked the matching labels based on their semantic similarity scores (obtained during the similarity search phase), taking the top 5 or 10 labels for RP@5 and RP@10 computation respectively.
+
+DocETL Implementation. In DocETL, we implement this task as an equijoin between articles and MedDRA labels, using a comparison prompt that asks “Can the following condition be found in the article?” The prompt includes both the article text and the label, as well as an indicator of whether the condition text appears as a substring of the article (which is possible in Jinja templating). We do not evaluate an unoptimized version of this pipeline, due to the over 6 million LLM call estimate (24,300 labels ×\times× 250 articles). DocETL optimized this into a map-equijoin pipeline. The map extracts the medical conditions per article, with a prompt designed for medical text but without demonstrations or examples. For equijoin, DocETL synthesized blocking rules including an embedding similarity threshold of 0.5253 and a requirement that all words in the reaction label appear in the article text. Finally, we add a reduce operation that asks the LLM to rank the identified labels for each article from most to least confident, enabling evaluation of ranking quality. To maintain a fair comparison with LOTUS, we did not apply DocETL’s reduce operator optimizations to this ranking step.
+
+####  5.4.2. Results
+
+The two pipelines differ in how they rank identified labels for each article. DocETL uses a reduce operation that asks the LLM to rank labels from most to least confident, while for LOTUS we use semantic similarity scores from the search phase, as their semantic aggregation operator operates on entire dataframes rather than groups, making LLM-based ranking per article outside the scope of their implementation.
+
+Table 6. Biomedical Classification Results. Since most articles have fewer than 25 relevant labels, RP@25 effectively measures recall rather than ranking quality. System | RP@5 | RP@10 | RP@25  
+---|---|---|---  
+DocETL | 0.281 | 0.313 | 0.371  
+LOTUS (Our reimplementation) | 0.213 | 0.207 | 0.206  
+LOTUS (Reported) | 0.241 | 0.258 | N/A  
+  
+The difference in ranking approaches does not disadvantage either system. At RP@25, which effectively measures recall since articles contain fewer than 25 relevant labels in the ground truth, DocETL still shows an 80% improvement over reimplemented LOTUS. For RP@5 and RP@10, DocETL shows 33% and 50% improvements, respectively. This substantial improvement in recall likely stems from DocETL’s synthesized blocking rules: while LOTUS relies purely on embedding similarity to identify candidate reactions, DocETL’s additional rule requiring all words in the reaction label to appear in the article text may surface relevant reactions that have low embedding similarity scores. While LOTUS’ reported performance is greater, it still falls well short of DocETL. We suspect this gap may be because the reported version provides multiple few-shot examples—which we don’t.
+
+Cost and Dataset Analysis. Our reimplemented LOTUS pipeline costs $0.47 and takes 925 seconds to run. The DocETL pipeline costs $3.65 and takes 463.28 seconds, with an additional optimization cost of $2.37. We believe this additional cost is an acceptable tradeoff because of the between 30-80% improvement in RP; moreover, these costs would be insignificant with open-source LLMs. The runtime can be highly variable; as LLMs can have high tail latencies, and LOTUS and DocETL may implement LLM retry logic differently.
+
+Manual inspection of the results reveals inherent challenges with the task and dataset quality. We found numerous cases where ground truth labels were not actually discussed in the article text, as well as instances where DocETL correctly identified adverse reactions present in the text but missing from the ground truth annotations. This suggests that dataset quality may be the primary factor limiting performance scores across all approaches, rather than limitations of the systems themselves.
+
+###  5.5. Case Study: Police Misconduct
+
+We conducted an case study on police misconduct identification (Example 1.1) using a dataset of 227 documents from various California police departments. This is only a sample of the hundreds of thousands of documents collected by our collaborators at the California Police Records Access Project666https://cdss.berkeley.edu/news/state-funds-development-first-its-kind-police-misconduct-database. This dataset presented several challenges: documents averaged 12,500 tokens, with 2% exceeding the 128,000 token context window limit. The corpus had an unknown number of cases and several hundred police officers mentioned777Due to the presence of PII, and the sensitive nature of these documents, we unfortunately cannot open-source our data..
+
+The task was to generate detailed misconduct summaries for each officer who exhibited misconduct, including the officer’s name, misconduct types, and a comprehensive summary. We implemented an initial pipeline in DocETL consisting of a map operation to extract officers who exhibited misconduct from each document, followed by an unnest operation to flatten this list of officers, and a reduce operation to summarize misconduct across relevant documents for each officer. For documents exceeding the context limit, we truncated tokens from the middle until they fit within the LLM’s context window. Prompts for this pipeline define “misconduct” and are written by engineers and journalists employed full-time by the Police Records Access Project.
+
+Running this pipeline as-is led to very incorrect outputs, as police officer names need to undergo entity resolution prior to the reduce operation. In practice, the team runs a domain-specific clustering algorithm, followed by human annotation, to de-duplicate police officer names. As such, our initial pipeline (denoted Baseline) therefore also includes a resolve operation before the reduce operation, as per the rewrite directive, Equation 9. This resolve operation was synthesized by DocETL (i.e., comparison prompt, resolution prompt, and embedding thresholds for blocking).
+
+We evaluated two other pipeline variants, each of which were considered by the optimizer, as well as the final one chosen by the optimizer, all using GPT-4o-mini. It is not obvious which pipeline will be most accurate. The pipelines are as follows:
+
+  1. (1)
+
+DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT: This pipeline applies Equation 12—a projection synthesis rewrite—to extract misconduct summaries for identified officers in addition to the officer name before the resolve step. The reduce operation then only summarizes these extracted summaries, as opposed to processing the entire documents.
+
+  2. (2)
+
+DocETLTsubscriptDocETL𝑇\textsc{DocETL}_{T}DocETL start_POSTSUBSCRIPT italic_T end_POSTSUBSCRIPT: This pipeline builds upon DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT by extracting both misconduct summaries and types from each document. It then incorporates both the summaries and types in the reduce step, providing more structured information for aggregation.
+
+  3. (3)
+
+DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT: This pipeline, selected by the optimizer, extends DocETLTsubscriptDocETL𝑇\textsc{DocETL}_{T}DocETL start_POSTSUBSCRIPT italic_T end_POSTSUBSCRIPT by chunking documents into 12,840 token segments. It includes metadata extraction and a peripheral context configuration of two previous chunks in full and a summary of earlier content. The map operation is applied to each chunk, followed by a synthesized operation to reduce chunk results per document. Like other pipelines, this is then followed by the officer name resolution step and a final reduce step to aggregate summaries per officer. We will discuss the details of the plan subsequently.
+
+Results. To evaluate output quality without ground truth data, we came up with three binary criteria: (i) whether each officer name referred to a real person, (ii) if the summary included dates and locations of misconduct, and (iii) whether each identified misconduct instance was extensively described in the summary. To assess the accuracy of our evaluation criteria, we employed GPT-4o-mini as a judge to evaluate each criterion for over 1,500 outputs across the baseline and all variants. To validate the LLM’s judgments, we conducted a human evaluation on a subset of the data. For the first two criteria (officer name validity and inclusion of dates/locations), one of the authors manually assessed 100 randomly sampled outputs from both the baseline and DocETL variants. For the third criterion (extensive description of misconduct), due to the detailed and often graphic nature of the summaries, the author evaluated 50 output summaries, a process that required several hours of careful reading. The human evaluation revealed high agreement between the LLM judge and human assessor—96%, 97%, and 92% respectively—suggesting that our LLM-based evaluation method is a reliable proxy for human judgment in this task.
+
+Table 7 illustrates these results. DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT is, on average, 1.34×\mathbf{1.34\times}bold_1.34 × more accurate compared to the baseline. The DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT and DocETLTsubscriptDocETL𝑇\textsc{DocETL}_{T}DocETL start_POSTSUBSCRIPT italic_T end_POSTSUBSCRIPT pipelines performed similarly, with the notable exception of DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT, which often omitted dates and locations from summaries.
+
+Table 7. Evaluation Metrics for Police Misconduct Identification Pipelines. Each value represents the fraction of outputs that pass the metric. Metric |  Baseline |  DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT |  DocETLTsubscriptDocETL𝑇\textsc{DocETL}_{T}DocETL start_POSTSUBSCRIPT italic_T end_POSTSUBSCRIPT |  DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT  
+---|---|---|---|---  
+The officer’s name is a specific name, not generic (e.g., not “Officer 1”) |  0.84 |  0.93 |  0.89 |  0.87  
+The summary contains a date and location |  0.67 |  0.1 |  0.91 |  0.92  
+Each identified instance of misconduct is described extensively in the summary |  0.42 |  0.78 |  0.76 |  0.80  
+  
+Our evaluation underscores the complexity and task-specific nature of assessing LLM-based pipelines. While the outputs of different plans may appear similar at first glance, our analysis reveals some variations in their quality and reliability. The baseline’s poor performance highlights the importance of our rewrite rules. DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT’s summaries consistently failed to mention locations. DocETLTsubscriptDocETL𝑇\textsc{DocETL}_{T}DocETL start_POSTSUBSCRIPT italic_T end_POSTSUBSCRIPT and DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT offered the most reliable results, with the latter being particularly suited for longer documents. This variability in plan performance emphasizes the necessity of DocETL’s custom validation agents, which demonstrated proficiency in understanding the task-specific nature of evaluation: for instance, the map operation’s evaluation prompt focused on the completeness of incident details and correct categorization of misconduct types, while the reduce operation’s prompt emphasized accuracy of aggregation and information retention across cases. Without such tailored validation mechanisms, discerning the relative strengths of each plan would be challenging, if not impossible—highlighting the critical role of task-specific optimization and evaluation in LLM-powered document analysis.
+
+DocETL’s Optimized Pipeline. The DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT pipeline can be expressed using our rewrite directive syntax as follows:
+
+|  | Map→Unnest→Reduce⇒→MapUnnest→Reduce⇒absent\displaystyle\text{Map}\to\text{Unnest}\to\text{Reduce}\RightarrowMap → Unnest → Reduce ⇒ |   
+---|---|---|---  
+|  | MapM→Split→(MapS∥MapH)→Gather→Map→(Mapv→Mapi)≤1→ReduceD→Unnest→Resolve→Reduce→subscriptMap𝑀Split→conditionalsubscriptMap𝑆subscriptMap𝐻→Gather→Map→absent→superscript→subscriptMap𝑣subscriptMap𝑖absent1subscriptReduce𝐷→Unnest→Resolve→Reduce\displaystyle\begin{aligned} \text{Map}_{M}\to\text{Split}\to(\text{Map}_{S}% \parallel\text{Map}_{H})\to\text{Gather}\to\text{Map}\to\\\ (\text{Map}_{v}\to\text{Map}_{i})^{\leq 1}\to\text{Reduce}_{D}\to\text{Unnest}% \to\text{Resolve}\to\text{Reduce}\end{aligned}start_ROW start_CELL Map start_POSTSUBSCRIPT italic_M end_POSTSUBSCRIPT → Split → ( Map start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT ∥ Map start_POSTSUBSCRIPT italic_H end_POSTSUBSCRIPT ) → Gather → Map → end_CELL end_ROW start_ROW start_CELL ( Map start_POSTSUBSCRIPT italic_v end_POSTSUBSCRIPT → Map start_POSTSUBSCRIPT italic_i end_POSTSUBSCRIPT ) start_POSTSUPERSCRIPT ≤ 1 end_POSTSUPERSCRIPT → Reduce start_POSTSUBSCRIPT italic_D end_POSTSUBSCRIPT → Unnest → Resolve → Reduce end_CELL end_ROW |   
+  
+where {officer_name}officer_name\\{{\small\texttt{officer\\_name}}\\}{ officer_name } is the reduce key for the final summarization.
+
+This pipeline begins with a map operation to extract metadata (MapMsubscriptMap𝑀\text{Map}_{M}Map start_POSTSUBSCRIPT italic_M end_POSTSUBSCRIPT), followed by document chunking of 12840 tokens each (Split). Each chunk then undergoes parallel processing: MapSsubscriptMap𝑆\text{Map}_{S}Map start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT for summarization and MapHsubscriptMap𝐻\text{Map}_{H}Map start_POSTSUBSCRIPT italic_H end_POSTSUBSCRIPT for header extraction. The Gather operation collects context for each chunk, including the header lineage for the current chunk, 2 full previous chunks, and summaries of the other previous chunks. The original Map operation is then applied to each rendered chunk, with gleaning applied for refinement. Results from all chunks of a document are combined using ReduceDsubscriptReduce𝐷\text{Reduce}_{D}Reduce start_POSTSUBSCRIPT italic_D end_POSTSUBSCRIPT. The pipeline then flattens the results (Unnest), resolves officer names (Resolve), and finally summarizes misconduct per officer (Reduce). This optimized pipeline incorporates several of our rewrite rules, including document chunking (1), header lineage context and summarization (3), gleaning for the Map operations (7), and duplicate key resolution (9).
+
+Costs. For our sample dataset of 227 documents, the baseline incurred $2.24, while DocETLSsubscriptDocETL𝑆\textsc{DocETL}_{S}DocETL start_POSTSUBSCRIPT italic_S end_POSTSUBSCRIPT and DocETLTsubscriptDocETL𝑇\textsc{DocETL}_{T}DocETL start_POSTSUBSCRIPT italic_T end_POSTSUBSCRIPT each cost $0.55. DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT was more expensive at $1.35 due to processing all document chunks, but less expensive than the baseline (due to not needing to include entire documents in the reduce operation). Running the optimizer incurred a cost of approximately $100 and took about 20 minutes, with the bulk of the expense attributed to validation agents processing lengthy documents. DocETLOsubscriptDocETL𝑂\textsc{DocETL}_{O}DocETL start_POSTSUBSCRIPT italic_O end_POSTSUBSCRIPT took 364.97 seconds to run, and all other pipelines completed in less than 180 seconds. While the optimization cost of $100 for a task that takes <$3absentcurrency-dollar3<\$3< $ 3 may seem high, note that we are merely operating on a sample of the overall dataset; processing the dataset has already cost the team over $50,000; so this one-time cost of $100 is amortized across processing hundreds of thousands of documents. As part of this process, the optimizer considered and evaluated over 200 pipeline variants. As models become more cost-effective (e.g., GPT-4o-mini is over 100×100\times100 × cheaper), optimization costs will decrease significantly, making the investment even more worthwhile in the long run.
+
+###  5.6. User Adoption and Impact
+
+Since releasing DocETL as open source software in October 2024, we have observed increasing adoption across diverse domains and use cases. Users report successfully applying DocETL to complex document processing tasks where other tools struggled—for instance, one user switched from LlamaIndex to DocETL for automatically constructing knowledge graphs from textbooks, citing significantly improved results “on the first try.” In another use case, the CEO of a security company who uses DocETL for multiple pipelines (e.g., analyzing logs) said, “DocETL is simply amazing. It simplifies what would otherwise be a painful document processing pipeline.” We’ve seen successful deployments spanning healthcare (medical record analysis), legal (real estate closing documents, regulatory compliance), and scientific research (synthetic biology literature analysis, climate action plan evaluation). Users have also applied DocETL to more general enterprise tasks like summarizing customer support tickets, extracting insights from financial reports, and resolving product entities in e-commerce catalogs. A particularly challenging use case involves forensic psychiatry records dating back to the 1970s, where DocETL effectively processes a mix of handwritten notes, various form formats, and evolving electronic records. While in many cases, DocETL adds multiple synthesized operations to a pipeline, users are able to—and want to—understand DocETL’s optimized plans; the operations are simply described by natural language prompts, making them intuitive and transparent.
+
+Since the initial release, based on user feedback, we have extended DocETL with production-critical features including rate limiting and open source model support, optimization of the resolve operator to skip redundant comparisons via transitivity, logging of intermediate outputs and prompts for observability, and a UI playground for rapid prototyping.
+
+##  6\. Discussion
+
+Reflecting on our evaluation results, we observe significant variations in output quality between different candidate plans, underscoring the promise of agentic approaches in optimizing LLM-powered data processing pipelines. However, these findings also highlight the challenges inherent in optimization for such systems. The optimization process in DocETL is fundamentally a best-effort approach, relying on AI agents that, while powerful, are not infallible. The space of possible plan interpretations and decompositions is vast—potentially infinite—and we are limited by the agents’ ability to navigate this space effectively. For instance, when applying a projection synthesis rule (Section 3.3), an agent could conceivably generate any number of map operations to augment or focus the context for the main operation. The quality of the resulting pipeline thus heavily depends on the agent’s ability to guide good decompositions and craft effective prompts for such decompositions.
+
+This reliance on AI agents for optimization suggests the need for a more human-in-the-loop approach. Human intuition can be invaluable in creating prompts for subtasks, or in identifying promising decomposition strategies. This is particularly important given the unintuitive nature of the Pareto frontier of plans, as observed in our results and noted in prior work (Liu et al., 2024b). The fact that some plans are both cheaper and better in terms of output quality challenges conventional optimization heuristics and makes it difficult to devise effective strategies for searching the space of possible plans.
+
+Another difficult challenge is that people often face uncertainty when defining their requirements for AI-powered pipelines. Their needs may only become clear after seeing initial outputs from the system (Shankar et al., 2024b, a). This calls for a more interactive approach to pipeline building, where users can iteratively refine their pipelines based on intermediate results. Additionally, allowing users to influence or even write the validator prompts themselves could provide a powerful mechanism to incorporate domain knowledge and specific evaluation criteria into the optimization process.
+
+It’s important to note that DocETL is not intended for tasks requiring the synthesis of new knowledge beyond what is contained in the input data or provided in operation prompts. Its strength lies in extracting, transforming, and analyzing existing information within large, unstructured datasets—–tasks that traditionally might require significant manual effort and teams of human annotators or domain experts (Nigatu et al., 2023). This allows DocETL to excel in scenarios like our police misconduct analysis case, where it can process vast amounts of unstructured data to reveal patterns and insights.
+
+As we continue to develop DocETL, we are addressing several engineering challenges to enhance its functionality and accessibility. These include implementing robust provenance tracking to allow users to trace analyses back to source documents, enabling compatibility with local LLMs for increased privacy and reduced cloud dependency, and improving scalability for larger datasets.
+
+##  7\. Related Work
+
+LLM-powered data processing frameworks have recently gained significant attention in the database community. LOTUS (Patel et al., 2024) extends Pandas with semantic operators, while Palimpzest (Liu et al., 2024b) provides a declarative framework focusing on map-like operations. Aryn (Anderson et al., 2024) offers a Spark-like API with PDF extraction capabilities and human-in-the-loop processing. These systems employ various cost-based optimizations, including classical techniques like predicate pushdown (Hellerstein and Stonebraker, 2005) and ML-specific approaches like model cascades (Wang et al., 2017). However, they assume that capable LLMs will produce sufficiently accurate results for user-defined operations. In practice, even state-of-the-art models fall short on complex document processing tasks. DocETL addresses this limitation through agent-driven optimization, exploring decomposition to improve accuracy. Moreover, DocETL is, uniquely, the only system to support documents with lengths that exceed LLM context windows.
+
+Other LLM-powered data processing systems focus on different settings. ZenDB (Lin et al., 2024) optimizes SQL queries for templatized documents, while DocETL handles arbitrary document formats. EVAPORATE (Arora et al., 2023) specializes in table extraction through code synthesis (only where applicable, in semi-structured settings), which could complement DocETL. Regarding LLM agents: Caesura (Urban and Binnig, 2024) uses LLMs to translate natural language to SQL pipelines but leaves optimization for future work; CleanAgent (Qi and Wang, 2024) uses agents to standardize and clean data (and also does not consider optimization). Other systems propose specialized pipelines for specific tasks: for instance, Edge et al. (2024) use a fixed map-reduce pipeline with predefined prompts for knowledge graph querying—whereas DocETL enables flexible pipeline construction and optimization for any document processing task. While prompt optimization (Wen et al., 2024; Khattab et al., 2024) could also complement DocETL, it falls short on complex document tasks, even with human guidance (White et al., 2023), particularly when data and tasks exceed single LLM call capabilities.
+
+LLMs have been leveraged for a variety of data tasks beyond document processing. Recent work has explored its application for join discovery (Dong et al., 2022; Kayali et al., 2024), database tuning (Trummer, 2022), ML pipelines (Shankar and Parameswaran, 2024), natural language to SQL (Pourreza et al., 2024), and semantic table understanding (Fang et al., 2024; Cong et al., 2023). These efforts demonstrate the data management’s interest and success in applying LLMs (Fernandez et al., 2023b), but unlike DocETL, a general-purpose declarative system, they instead target specific problems with custom LLM implementations.
+
+Finally, declarative frameworks for intelligent data processing have a rich history in database research through crowdsourcing systems like CrowdDB, Deco, CDB, and Qurk (Franklin et al., 2011; Parameswaran et al., 2012; Li et al., 2018; Marcus et al., 2011). While these systems use human rather than machine intelligence, they demonstrate declarative interfaces’ power for complex tasks. DocETL extends this tradition to address the unique challenges of LLM-powered processing (Parameswaran et al., 2024) through its flexible interface and agent-driven optimization.
+
+##  8\. Conclusion
+
+We introduced DocETL, a declarative system that optimizes complex document processing tasks using LLMs. By focusing on improving accuracy rather than just reducing costs, DocETL addresses critical limitations in existing LLM-powered data processing frameworks. We introduced several novel rewrite directives, an agent-based framework for plan rewriting and evaluation, and an opportunistic optimization strategy to handle the unique challenges of unstructured data analysis. Our evaluation across four unstructured document analysis tasks demonstrated that DocETL can find plans with outputs 25-80% more accurate than baselines. As LLMs continue to evolve and new challenges in complex document processing emerge, DocETL’s architecture provides a flexible foundation for future research and applications in complex document processing.
+
+## References
+
+  * (1)
+  * Anderson et al. (2024) Eric Anderson, Jonathan Fritz, Austin Lee, Bohou Li, Mark Lindblad, Henry Lindeman, Alex Meyer, Parth Parmar, Tanvi Ranade, Mehul A. Shah, Benjamin Sowell, Dan Tecuci, Vinayak Thapliyal, and Matt Welsh. 2024.  The Design of an LLM-powered Unstructured Analytics System.  arXiv:2409.00847 [cs.DB] https://arxiv.org/abs/2409.00847
+  * Appenzeller (2024) Guido Appenzeller. 2024.  Welcome to LLMflation – LLM inference cost is going down fast.  _a16z Blog, https://a16z.com/llmflation-llm-inference-cost/_ (2024). 
+  * Arora et al. (2023) Simran Arora, Brandon Yang, Sabri Eyuboglu, Avanika Narayan, Andrew Hojel, Immanuel Trummer, and Christopher Ré. 2023.  Language models enable simple systems for generating structured views of heterogeneous data lakes.  _arXiv preprint arXiv:2304.09433_ (2023). 
+  * Bai et al. (2023) Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, et al. 2023\.  Longbench: A bilingual, multitask benchmark for long context understanding.  _arXiv preprint arXiv:2308.14508_ (2023). 
+  * Chaudhuri (1998) Surajit Chaudhuri. 1998.  An overview of query optimization in relational systems. In _Proceedings of the seventeenth ACM SIGACT-SIGMOD-SIGART symposium on Principles of database systems_. 34–43. 
+  * Christophides et al. (2020) Vassilis Christophides, Vasilis Efthymiou, Themis Palpanas, George Papadakis, and Kostas Stefanidis. 2020.  An Overview of End-to-End Entity Resolution for Big Data.  _ACM Comput. Surv._ 53, 6, Article 127 (dec 2020), 42 pages.  https://doi.org/10.1145/3418896
+  * Condie et al. (2010) Tyson Condie, Neil Conway, Peter Alvaro, Joseph M Hellerstein, Khaled Elmeleegy, and Russell Sears. 2010.  MapReduce online.. In _Nsdi_ , Vol. 10. 20. 
+  * Cong et al. (2023) Tianji Cong, Madelon Hulsebos, Zhenjie Sun, Paul Groth, and HV Jagadish. 2023.  Observatory: Characterizing Embeddings of Relational Tables.  _Proceedings of the VLDB Endowment_ 17, 4 (2023), 849–862. 
+  * Dong et al. (2022) Yuyang Dong, Chuan Xiao, Takuma Nozawa, Masafumi Enomoto, and Masafumi Oyamada. 2022.  DeepJoin: Joinable Table Discovery with Pre-trained Language Models.  _arXiv preprint arXiv:2212.07588_ (2022). 
+  * D’Oosterlinck et al. (2023) Karel D’Oosterlinck, François Remy, Johannes Deleu, Thomas Demeester, Chris Develder, Klim Zaporojets, Aneiss Ghodsi, Simon Ellershaw, Jack Collins, and Christopher Potts. 2023.  BioDEX: Large-Scale Biomedical Adverse Drug Event Extraction for Real-World Pharmacovigilance. In _Findings of the Association for Computational Linguistics: EMNLP 2023_ , Houda Bouamor, Juan Pino, and Kalika Bali (Eds.). Association for Computational Linguistics, Singapore, 13425–13454.  https://doi.org/10.18653/v1/2023.findings-emnlp.896
+  * Douze et al. (2024) Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024.  The faiss library.  _arXiv preprint arXiv:2401.08281_ (2024). 
+  * Edge et al. (2024) Darren Edge, Ha Trinh, Newman Cheng, Joshua Bradley, Alex Chao, Apurva Mody, Steven Truitt, and Jonathan Larson. 2024.  From local to global: A graph rag approach to query-focused summarization.  _arXiv preprint arXiv:2404.16130_ (2024). 
+  * Fang et al. (2024) Xi Fang, Weijie Xu, Fiona Anting Tan, Jiani Zhang, Ziqing Hu, Yanjun Qi, Scott Nickleach, Diego Socolinsky, Srinivasan Sengamedu, and Christos Faloutsos. 2024.  Large Language Models on Tabular Data–A Survey.  _arXiv preprint arXiv:2402.17944_ (2024). 
+  * Fernandez et al. (2023a) Raul Castro Fernandez, Aaron J. Elmore, Michael J. Franklin, Sanjay Krishnan, and Chenhao Tan. 2023a.  How Large Language Models Will Disrupt Data Management.  _Proc. VLDB Endow._ 16, 11 (jul 2023), 3302–3309.  https://doi.org/10.14778/3611479.3611527
+  * Fernandez et al. (2023b) Raul Castro Fernandez, Aaron J Elmore, Michael J Franklin, Sanjay Krishnan, and Chenhao Tan. 2023b.  How large language models will disrupt data management.  _Proceedings of the VLDB Endowment_ 16, 11 (2023), 3302–3309. 
+  * Franklin et al. (2011) Michael J Franklin, Donald Kossmann, Tim Kraska, Sukriti Ramesh, and Reynold Xin. 2011.  CrowdDB: answering queries with crowdsourcing. In _Proceedings of the 2011 ACM SIGMOD International Conference on Management of data_. 61–72. 
+  * Graefe (1995) Goetz Graefe. 1995.  The Cascades Framework for Query Optimization.  _IEEE Data(base) Engineering Bulletin_ 18 (1995), 19–29.  https://api.semanticscholar.org/CorpusID:260706023
+  * Gupta et al. (1993) Ashish Gupta, Inderpal Singh Mumick, and Venkatramanan Siva Subrahmanian. 1993.  Maintaining views incrementally.  _ACM SIGMOD Record_ 22, 2 (1993), 157–166. 
+  * Hellerstein and Stonebraker (2005) Joseph M Hellerstein and Michael Stonebraker. 2005.  Anatomy of a database system.  _Readings in Database Systems,_ (2005). 
+  * Hendrycks et al. (2021) Dan Hendrycks, Collin Burns, Anya Chen, and Spencer Ball. 2021.  CUAD: An Expert-Annotated NLP Dataset for Legal Contract Review.  _NeurIPS_ (2021). 
+  * Jiang et al. (2023) Huiqiang Jiang, Qianhui Wu, Xufang Luo, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. 2023.  Longllmlingua: Accelerating and enhancing llms in long context scenarios via prompt compression.  _arXiv preprint arXiv:2310.06839_ (2023). 
+  * Kalai and Vempala (2024) Adam Tauman Kalai and Santosh S Vempala. 2024.  Calibrated language models must hallucinate. In _Proceedings of the 56th Annual ACM Symposium on Theory of Computing_. 160–171. 
+  * Kayali et al. (2024) Moe Kayali, Anton Lykov, Ilias Fountalis, Nikolaos Vasiloglou, Dan Olteanu, and Dan Suciu. 2024.  Chorus: Foundation Models for Unified Data Discovery and Exploration.  _Proceedings of the VLDB Endowment_ 17, 8 (2024), 2104–2114. 
+  * Khattab et al. (2024) Omar Khattab, Arnav Singhvi, Paridhi Maheshwari, Zhiyuan Zhang, Keshav Santhanam, Saiful Haq, Ashutosh Sharma, Thomas T Joshi, Hanna Moazam, Heather Miller, et al. 2024\.  DSPy: Compiling Declarative Language Model Calls into State-of-the-Art Pipelines. In _The Twelfth International Conference on Learning Representations_. 
+  * Levy et al. (2024) Mosh Levy, Alon Jacoby, and Yoav Goldberg. 2024.  Same task, more tokens: the impact of input length on the reasoning performance of large language models.  _arXiv preprint arXiv:2402.14848_ (2024). 
+  * Li et al. (2018) Guoliang Li, Chengliang Chai, Ju Fan, Xueping Weng, Jian Li, Yudian Zheng, Yuanbing Li, Xiang Yu, Xiaohang Zhang, and Haitao Yuan. 2018.  CDB: A crowd-powered database system.  _Proceedings of the VLDB Endowment_ 11, 12 (2018), 1926–1929. 
+  * Lin et al. (2024) Yiming Lin, Madelon Hulsebos, Ruiying Ma, Shreya Shankar, Sepanta Zeigham, Aditya G Parameswaran, and Eugene Wu. 2024.  Towards Accurate and Efficient Document Analytics with Large Language Models.  _arXiv preprint arXiv:2405.04674_ (2024). 
+  * Liu et al. (2024b) Chunwei Liu, Matthew Russo, Michael Cafarella, Lei Cao, Peter Baille Chen, Zui Chen, Michael Franklin, Tim Kraska, Samuel Madden, and Gerardo Vitagliano. 2024b.  A Declarative System for Optimizing AI Workloads.  _arXiv preprint arXiv:2405.14696_ (2024). 
+  * Liu et al. (2024a) Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, and Percy Liang. 2024a.  Lost in the middle: How language models use long contexts.  _Transactions of the Association for Computational Linguistics_ 12 (2024), 157–173. 
+  * Liu et al. (2024c) Yinhong Liu, Han Zhou, Zhijiang Guo, Ehsan Shareghi, Ivan Vulić, Anna Korhonen, and Nigel Collier. 2024c.  Aligning with Human Judgement: The Role of Pairwise Preference in Large Language Model Evaluators. In _First Conference on Language Modeling_.  https://openreview.net/forum?id=9gdZI7c6yr
+  * Marcus et al. (2011) Adam Marcus, Eugene Wu, David R Karger, Samuel Madden, and Robert C Miller. 2011.  Crowdsourced databases: Query processing with people. Cidr. 
+  * Nigatu et al. (2023) Hellina Hailu Nigatu, Lisa Pickoff-White, John Canny, and Sarah Chasins. 2023.  Co-Designing for Transparency: Lessons from Building a Document Organization Tool in the Criminal Justice Domain. In _Proceedings of the 2023 ACM conference on fairness, accountability, and transparency_. 1463–1478. 
+  * Nye et al. (2021) Maxwell Nye, Anders Johan Andreassen, Guy Gur-Ari, Henryk Michalewski, Jacob Austin, David Bieber, David Dohan, Aitor Lewkowycz, Maarten Bosma, David Luan, et al. 2021\.  Show your work: Scratchpads for intermediate computation with language models.  _arXiv preprint arXiv:2112.00114_ (2021). 
+  * Pallets (2024) Pallets. 2024.  Jinja.  https://github.com/pallets/jinja/.  Version 3.1.x. 
+  * Parameswaran et al. (2012) Aditya Ganesh Parameswaran, Hyunjung Park, Hector Garcia-Molina, Neoklis Polyzotis, and Jennifer Widom. 2012.  Deco: declarative crowdsourcing. In _Proceedings of the 21st ACM international conference on Information and knowledge management_. 1203–1212. 
+  * Parameswaran et al. (2024) Aditya G Parameswaran, Shreya Shankar, Parth Asawa, Naman Jain, and Yujie Wang. 2024.  Revisiting Prompt Engineering via Declarative Crowdsourcing.  _Cidr_ (2024). 
+  * Patel et al. (2024) Liana Patel, Siddharth Jha, Parth Asawa, Melissa Pan, Carlos Guestrin, and Matei Zaharia. 2024.  Semantic Operators: A Declarative Model for Rich, AI-based Analytics Over Text Data.  _arXiv preprint arXiv:2407.11418_ (2024). 
+  * Peng et al. (2024) Binghui Peng, Srini Narayanan, and Christos Papadimitriou. 2024.  On limitations of the transformer architecture.  _arXiv preprint arXiv:2402.08164_ (2024). 
+  * Pourreza et al. (2024) Mohammadreza Pourreza, Hailong Li, Ruoxi Sun, Yeounoh Chung, Shayan Talaei, Gaurav Tarlok Kakkar, Yu Gan, Amin Saberi, Fatma Ozcan, and Sercan O Arik. 2024.  Chase-sql: Multi-path reasoning and preference optimized candidate selection in text-to-sql.  _arXiv preprint arXiv:2410.01943_ (2024). 
+  * Qi and Wang (2024) Danrui Qi and Jiannan Wang. 2024.  CleanAgent: Automating Data Standardization with LLM-based Agents.  _arXiv preprint arXiv:2403.08291_ (2024). 
+  * Shankar et al. (2024a) Shreya Shankar, Haotian Li, Parth Asawa, Madelon Hulsebos, Yiming Lin, JD Zamfirescu-Pereira, Harrison Chase, Will Fu-Hinthorn, Aditya G Parameswaran, and Eugene Wu. 2024a.  spade: Synthesizing Data Quality Assertions for Large Language Model Pipelines.  _Proceedings of the VLDB Endowment_ 17, 12 (2024), 4173–4186. 
+  * Shankar and Parameswaran (2024) Shreya Shankar and Aditya G Parameswaran. 2024.  Building Reactive Large Language Model Pipelines with Motion. In _Companion of the 2024 International Conference on Management of Data_. 520–523. 
+  * Shankar et al. (2024b) Shreya Shankar, JD Zamfirescu-Pereira, Björn Hartmann, Aditya Parameswaran, and Ian Arawjo. 2024b.  Who validates the validators? aligning llm-assisted evaluation of llm outputs with human preferences. In _Proceedings of the 37th Annual ACM Symposium on User Interface Software and Technology_. 1–14. 
+  * Shi et al. (2023) Freda Shi, Xinyun Chen, Kanishka Misra, Nathan Scales, David Dohan, Ed H Chi, Nathanael Schärli, and Denny Zhou. 2023.  Large language models can be easily distracted by irrelevant context. In _International Conference on Machine Learning_. PMLR, 31210–31227. 
+  * Sui et al. (2024) Peiqi Sui, Eamon Duede, Sophie Wu, and Richard Jean So. 2024.  Confabulation: The Surprising Value of Large Language Model Hallucinations.  _arXiv preprint arXiv:2406.04175_ (2024). 
+  * Tang et al. (2023) Raphael Tang, Xinyu Zhang, Xueguang Ma, Jimmy Lin, and Ferhan Ture. 2023.  Found in the middle: Permutation self-consistency improves listwise ranking in large language models.  _arXiv preprint arXiv:2310.07712_ (2023). 
+  * Trummer (2022) Immanuel Trummer. 2022.  DB-BERT: a Database Tuning Tool that” Reads the Manual”. In _Proceedings of the 2022 international conference on management of data_. 190–203. 
+  * Urban and Binnig (2024) Matthias Urban and Carsten Binnig. 2024.  Demonstrating CAESURA: Language Models as Multi-Modal Query Planners. In _Companion of the 2024 International Conference on Management of Data_. 472–475. 
+  * van Schaik and Pugh (2024) Tempest A. van Schaik and Brittany Pugh. 2024.  A Field Guide to Automatic Evaluation of LLM-Generated Summaries. In _Annual International ACM SIGIR Conference on Research and Development in Information Retrieval_.  https://api.semanticscholar.org/CorpusID:271114432
+  * Wang et al. (2017) Xin Wang, Yujia Luo, Daniel Crankshaw, Alexey Tumanov, Fisher Yu, and Joseph E Gonzalez. 2017.  Idk cascades: Fast deep learning by learning not to overthink.  _arXiv preprint arXiv:1706.00885_ (2017). 
+  * Wen et al. (2024) Yuxin Wen, Neel Jain, John Kirchenbauer, Micah Goldblum, Jonas Geiping, and Tom Goldstein. 2024.  Hard prompts made easy: Gradient-based discrete optimization for prompt tuning and discovery.  _Advances in Neural Information Processing Systems_ 36 (2024). 
+  * White et al. (2023) Jules White, Quchen Fu, Sam Hays, Michael Sandborn, Carlos Olea, Henry Gilbert, Ashraf Elnashar, Jesse Spencer-Smith, and Douglas C Schmidt. 2023.  A prompt pattern catalog to enhance prompt engineering with chatgpt.  _arXiv preprint arXiv:2302.11382_ (2023). 
+  * Zhao et al. (2024) Jun Zhao, Can Zu, Hao Xu, Yi Lu, Wei He, Yiwen Ding, Tao Gui, Qi Zhang, and Xuanjing Huang. 2024.  LongAgent: Scaling Language Models to 128k Context through Multi-Agent Collaboration.  _arXiv preprint arXiv:2402.11550_ (2024). 
+
+##  Appendix A Gather Operator Specifications
+
+###  A.1. Gather Configuration
+
+The gather operation’s configuration includes:
+
+  * •
+
+The group ID key (document ID)
+
+  * •
+
+The order key (chunk sequence within a group)
+
+  * •
+
+The content key (field containing chunk content)
+
+  * •
+
+The peripheral chunk configuration
+
+The peripheral chunk configuration specifies “previous” and “next” sections, each potentially containing “head”, “middle”, and “tail” subsections, determining which surrounding chunks to include and how many. Each subsection must specify a content_key denoting the field to use as the content of the chunk.
+
+###  A.2. Header Lineage Preservation
+
+Figure 5. Example of Document Header Handling in a Gather Operation for Legal Contracts (Hendrycks et al., 2021). The example document has 74 pages. Headers are extracted from chunks via map operations. When rendering a chunk (e.g., Chunk 20), the operation includes the most recent headers of all levels (1, 2, etc.) above the first header in the current chunk, so the LLM has hierarchical context when processing the chunk.
+
+A unique feature of the gather operation is its ability to maintain document structure through headers. This is particularly useful for documents with complex structures where processing a chunk with a certain level header requires knowledge of headers in the levels above, which may be in other chunks.
+
+When a doc_header_key is specified in the configuration, the gather operation:
+
+  1. (1)
+
+Examines the doc_header_key field for every chunk preceding the one being rendered.
+
+  2. (2)
+
+Reconstructs the relevant header structure by identifying the level of the first header in the current chunk and including all most recent headers from higher levels found in previous chunks.
+
+  3. (3)
+
+Arranges these headers in their proper order.
+
+This process ensures that each rendered chunk includes a complete “path” of headers leading to its content, preserving the document’s overall structure and context even when split across multiple chunks.
+
+Figure 5 demonstrates header handling in a gather operation for a 74-page legal contract. Headers are extracted from chunks via map operations. When rendering a chunk (e.g., Chunk 20), the operation includes the most recent headers of all levels (1, 2, etc.) above the first header in the current chunk, providing hierarchical context for LLM processing.
+
+Generated on Sun Dec 8 06:20:21 2024 by LaTeXML

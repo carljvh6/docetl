@@ -1,0 +1,143 @@
+# datasets:
+#   transcripts: 
+#     path: medical_transcripts.json
+#     type: file
+
+# default_model: gpt-4o-mini
+
+# system_prompt:
+#   dataset_description: a collection of transcripts from doctor visits
+#   persona: a medical practitioner analyzing patient symptoms and medical history
+
+# operations:
+#   - name: filter_depression_cases
+#     type: filter
+#     sample: 100
+#     output:
+#       schema:
+#         has_depression: bool
+
+#     prompt: |
+#       Analyze the following medical transcript:
+#       {{ input.src }}
+      
+#       1. Determine if the patient has mentions any symptoms that would fit under the DSM-5 criteria for major depressive disorder
+#     model: gpt-4o-mini
+#     validate:
+#     - isinstance(output["has_depression"], bool)
+
+#   - name: extract_symptoms
+#     type: map
+#     output:
+#       schema: 
+#         depression_symptom: list[str]
+#         evidence_of_depressive_symptoms: list[str]
+#         list_of_dsm_criteria_fulfilled: list[str]
+#     prompt: |
+#       1 Make a list of all of symptoms that the patient mentioned in the consultation that are associated with depression and anxiety. List only symptoms that the patient explicitly mentioned
+#       2. Provide evidence from the transcripts of the sentences in which the the patient mentioned these symptoms. Give direct quotes the patient said in "". Only provide quotes that the patient gave in the transcript.
+#       3. List the DSM-5 criteria which could possible apply to the patient given these symptoms
+
+
+
+# pipeline:
+#   steps:
+#     - name: depression_symptom_analysis
+#       input: transcripts
+#       operations:
+#         - filter_depression_cases
+#         - extract_symptoms
+#   output:
+#     type: file
+#     path: depression_symptoms.json
+#     intermediate_dir: intermediate_results
+
+datasets:
+  transcripts: 
+    path: medical_transcripts.json
+    type: file
+
+default_model: gpt-4o-mini
+
+system_prompt:
+  dataset_description: a collection of transcripts from doctor visits
+  persona: a medical practitioner analyzing patient symptoms and medical history
+
+operations:
+  - name: filter_depression_cases
+    type: filter
+    sample: 50
+    output:
+      schema:
+        has_depression: bool
+    prompt: |
+      Analyze the following medical transcript:
+      {{ input.src }}
+      
+      1. Determine if the patient has mentions any symptoms that would fit under the DSM-5 criteria for major depressive disorder
+    model: gpt-4o-mini
+    validate:
+      - isinstance(output["has_depression"], bool)
+
+  - name: extract_symptoms
+    type: map
+    output:
+      schema: 
+        depression_symptom: list[str]
+        evidence_of_depressive_symptoms: list[str]
+        list_of_dsm_criteria_fulfilled: list[str]
+    prompt: |
+      Analyze the following medical transcript:
+      {{ input.src }}
+      1 Make a list of all of symptoms that the patient mentioned in the consultation that are associated with depression and anxiety. List only symptoms that the patient explicitly mentioned
+      2. Provide evidence from the transcripts of the sentences in which the the patient mentioned these symptoms. Give direct quotes the patient said in "". Only provide quotes that the patient gave in the transcript.
+      3. List the DSM-5 criteria which could possible apply to the patient given these symptoms
+
+  - name: pipeline_validation
+    type: map
+    output:
+      schema:
+        validated_symptoms: "list[{symptom: str, verified: bool, reason: str}]"
+        validated_evidence: "list[{quote: str, verified: bool, reason: str}]"
+        validation_summary: str
+    prompt: |
+      You are tasked with validating the accuracy of previously extracted depression symptoms and evidence.
+      
+      Original Transcript:
+      {{ input.src }}
+
+      Previously Extracted Information:
+      Symptoms: {{ input.depression_symptom }}
+      Evidence Quotes: {{ input.evidence_of_depressive_symptoms }}
+      
+      For each symptom and piece of evidence:
+      1. Carefully check if it actually appears in the original transcript
+      2. Verify quotes are exact matches (not paraphrased or altered)
+      3. Mark each as verified (true) or not verified (false)
+      4. Provide a brief reason for each verification decision
+      
+      Rules for verification:
+      - Symptoms must be explicitly mentioned in the transcript
+      - Quotes must match the transcript exactly, word for word
+      - Do not infer symptoms that aren't directly stated
+      - Do not accept paraphrased quotes as verified
+      
+      Important: Err on the side of being strict - only verify what is undeniably present in the transcript.
+    # validate:
+    #   - len(output.validated_symptoms) == len(input.depression_symptom)
+    #   - len(output.validated_evidence) == len(input.evidence_of_depressive_symptoms)
+    #   - all(isinstance(x.verified, bool) for x in output.validated_symptoms)
+    #   - all(isinstance(x.verified, bool) for x in output.validated_evidence)
+
+pipeline:
+  steps:
+    - name: depression_symptom_analysis
+      input: transcripts
+      operations:
+        - filter_depression_cases
+        - extract_symptoms
+        - pipeline_validation
+  output:
+    type: file
+    path: depression_symptoms.json
+    intermediate_dir: intermediate_results
